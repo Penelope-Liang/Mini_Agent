@@ -113,7 +113,7 @@ class AppointmentRegistration(API):
         }
         """
 
-        # 要有一个去重的功能，如果已经有了，就不要再添加了，还要报错
+        # Deduplicate appointments; raise an error if an identical registration already exists
         for appointment in self.database:
             if self.database[appointment]['patient_name'] == patient_name:
                 if self.format_check(self.database[appointment]['date']) == date:

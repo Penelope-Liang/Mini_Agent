@@ -39,4 +39,4 @@ for fname in src_files:
             f.writelines(lines)
         saved_files += 1
 
-print(f"源文件夹有 {total_files} 个文件，保存的有 {saved_files} 个文件")
+print(f"Source folder has {total_files} files; saved {saved_files} files")

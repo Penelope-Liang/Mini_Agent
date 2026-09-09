@@ -177,4 +177,7 @@ MiniAgent/
 
 ## License
 
-No license file yet. Until one is added, all rights are reserved.
+Original contributions that Penelope Liang has the right to license are
+available under the [MIT License](LICENSE). This does not cover inherited
+code or third-party materials, including `data/` and `paper/`.
+The inherited code's licensing status remains unresolved.
