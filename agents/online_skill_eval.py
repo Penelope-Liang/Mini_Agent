@@ -29,10 +29,10 @@ SideQuery = Callable[[str, str], Awaitable[str]]
 
 _RE_URL = re.compile(r"https?://\S+")
 _RE_MARKDOWN_LINK = re.compile(r"\[[^\]]+\]\((https?://[^)]+)\)")
-_RE_SOURCE_LABEL = re.compile(r"(?im)^\s*(source|sources|reference|references|来源|参考)\s*[:：]")
+_RE_SOURCE_LABEL = re.compile(r"(?im)^\s*(source|sources|reference|references)\s*:")
 _RE_JSON_PREFIX = re.compile(r"^\s*[\{\[]")
-_RE_CONCLUSION = re.compile(r"(?i)\b(tl;dr|answer|conclusion|bottom line)\b|结论|先说结论")
-_RE_PARAGRAPH_LIMIT = re.compile(r"(不超过|少于|最多|within|less than|at most)\s*(\d+)\s*(段|paragraph)")
+_RE_CONCLUSION = re.compile(r"(?i)\b(tl;dr|answer|conclusion|bottom line)\b")
+_RE_PARAGRAPH_LIMIT = re.compile(r"(within|less than|at most)\s*(\d+)\s*(paragraph)")
 
 
 def _utc_now() -> str:
@@ -212,7 +212,7 @@ def _compile_eval_rules(skill: dict[str, Any], *, include_llm_rules: bool = Fals
             }
         )
 
-    if any(key in low for key in ("引用来源", "标注来源", "注明来源", "cite sources", "with sources", "provide sources", "source-backed")):
+    if any(key in low for key in ("cite sources", "with sources", "provide sources", "source-backed")):
         rules.append(
             {
                 "rule_id": "must_cite_sources",
@@ -237,7 +237,7 @@ def _compile_eval_rules(skill: dict[str, Any], *, include_llm_rules: bool = Fals
             }
         )
 
-    if any(key in low for key in ("先给结论", "结论在前", "先说结论", "answer first", "lead with the conclusion", "bottom line first")):
+    if any(key in low for key in ("answer first", "lead with the conclusion", "bottom line first")):
         rules.append(
             {
                 "rule_id": "lead_with_conclusion",
@@ -249,7 +249,7 @@ def _compile_eval_rules(skill: dict[str, Any], *, include_llm_rules: bool = Fals
             }
         )
 
-    if "json" in low or "结构化输出" in low:
+    if "json" in low:
         rules.append(
             {
                 "rule_id": "json_parseable",
@@ -261,7 +261,7 @@ def _compile_eval_rules(skill: dict[str, Any], *, include_llm_rules: bool = Fals
             }
         )
 
-    if "markdown table" in low or "表格" in low:
+    if "markdown table" in low:
         rules.append(
             {
                 "rule_id": "markdown_table",
@@ -276,9 +276,6 @@ def _compile_eval_rules(skill: dict[str, Any], *, include_llm_rules: bool = Fals
     if include_llm_rules and any(
         key in low
         for key in (
-            "不要幻觉",
-            "不要编造",
-            "不确定就说",
             "don't hallucinate",
             "do not hallucinate",
             "avoid hallucination",
@@ -298,7 +295,7 @@ def _compile_eval_rules(skill: dict[str, Any], *, include_llm_rules: bool = Fals
                 "provenance": {"source": "skill_text"},
             }
         )
-    elif any(key in low for key in ("不要幻觉", "不要编造", "不确定就说", "do not hallucinate", "avoid hallucination", "if unsure")):
+    elif any(key in low for key in ("do not hallucinate", "avoid hallucination", "if unsure")):
         rules.append(
             {
                 "rule_id": "uncertainty_marked",
@@ -352,7 +349,7 @@ def _paragraph_limit(text: str) -> int:
         except Exception:
             continue
     low = _normalize_text(text)
-    if "少于 3 段" in low or "不超过 3 段" in low or "3 paragraphs" in low:
+    if "3 paragraphs" in low:
         return 3
     return 0
 
@@ -394,8 +391,8 @@ def _evaluate_rule(rule: dict[str, Any], response_text: str) -> dict[str, Any]:
         passed = len(lines) >= 2 and any("---" in line for line in lines)
         details = {"table_line_count": len(lines)}
     elif mode == "uncertainty_marked":
-        uncertainty_terms = ("不确定", "无法确认", "需要验证", "uncertain", "not sure", "cannot verify")
-        fabrication_terms = ("可能", "假设", "if", "assuming", "needs verification")
+        uncertainty_terms = ("uncertain", "not sure", "cannot verify")
+        fabrication_terms = ("if", "assuming", "needs verification")
         passed = any(term in stripped.lower() for term in uncertainty_terms + fabrication_terms)
         details = {"heuristic": "uncertainty_marker"}
     else:

@@ -1,14 +1,14 @@
-# MiniAgent
+# Mini Agent
 
 A minimal, readable **agent runtime** in Python. You talk to it in a terminal; it reasons with a model, calls tools to read and change real files, checks permissions before acting, and remembers what it learned.
 
 The model only decides *what* to do. The runtime decides *whether it is allowed* and actually does it: permission checks, tool execution, feeding results back, compacting long context, and persisting reusable experience.
 
-## Why MiniAgent
+## Why Mini Agent
 
 Most agent examples stop at "call a model, print the reply". The interesting and difficult part is everything around the model — the harness.
 
-MiniAgent exists to make that harness small enough to read in an afternoon, but complete enough to be real:
+Mini Agent exists to make that harness small enough to read in an afternoon, but complete enough to be real:
 
 - One clear agent loop instead of a framework you have to reverse-engineer.
 - Real execution boundaries: tools run under a permission mode, not on trust.
@@ -120,11 +120,11 @@ This repository ships one example, `code_review`:
 
 Skills are optional — the runtime works with none installed. Adding one requires no code changes.
 
-MiniAgent can also refine Skills from your feedback. When you state a durable rule (not a one-off request), it can add a new Skill or merge the rule into an existing one, recording where the change came from. See [docs/skill-evolution.md](docs/skill-evolution.md).
+Mini Agent can also refine Skills from your feedback. When you state a durable rule (not a one-off request), it can add a new Skill or merge the rule into an existing one, recording where the change came from. See [docs/skill-evolution.md](docs/skill-evolution.md).
 
 ## Evaluation
 
-MiniAgent includes a built-in evaluation pipeline for **Skill quality**: it replays historical conversations against the rules compiled from each `SKILL.md`, optionally using an LLM judge, and reports whether a Skill is actually being retrieved and used.
+Mini Agent includes a built-in evaluation pipeline for **Skill quality**: it replays historical conversations against the rules compiled from each `SKILL.md`, optionally using an LLM judge, and reports whether a Skill is actually being retrieved and used.
 
 ```bash
 python3 -m agents.online_skill_eval   # programmatic rules only

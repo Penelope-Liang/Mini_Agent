@@ -53,7 +53,7 @@ def _write_json(path: Path, value: Any) -> None:
 
 def _safe_skill_slug(name: str) -> str:
     raw = str(name or "").strip()
-    slug = re.sub(r"[^A-Za-z0-9_.\-\u4e00-\u9fff]+", "-", raw)
+    slug = re.sub(r"[^A-Za-z0-9_.\-]+", "-", raw)
     slug = re.sub(r"-{2,}", "-", slug).strip("-.")
     if slug:
         return slug[:120].rstrip("-.") or slug[:120]

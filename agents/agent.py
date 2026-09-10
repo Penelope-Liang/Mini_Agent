@@ -1685,59 +1685,59 @@ class Agent:
                     self._confirmed_paths.add(perm["message"])
                 oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
 
-                oai_batches: list[dict] = []
-                for ct in oai_checked:
-                    safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
-                    if safe and oai_batches and oai_batches[-1]["concurrent"]:
-                        oai_batches[-1]["items"].append(ct)
-                    else:
-                        oai_batches.append({"concurrent": safe, "items": [ct]})
+            oai_batches: list[dict] = []
+            for ct in oai_checked:
+                safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
+                if safe and oai_batches and oai_batches[-1]["concurrent"]:
+                    oai_batches[-1]["items"].append(ct)
+                else:
+                    oai_batches.append({"concurrent": safe, "items": [ct]})
 
-                oai_context_break = False
-                for batch in oai_batches:
-                    if oai_context_break or self._aborted:
-                        break
+            oai_context_break = False
+            for batch in oai_batches:
+                if oai_context_break or self._aborted:
+                    break
 
-                    if batch["concurrent"]:
-                        async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
-                            raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
-                            raw = _safe_utf8_text(raw)
-                            res = self._persist_large_result(ct_item["fn"], raw)
-                            print_tool_result(ct_item["fn"], res)
-                            return ct_item, res
+                if batch["concurrent"]:
+                    async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
+                        raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
+                        raw = _safe_utf8_text(raw)
+                        res = self._persist_large_result(ct_item["fn"], raw)
+                        print_tool_result(ct_item["fn"], res)
+                        return ct_item, res
 
-                        results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
-                        for ct_item, res in results:
-                            self._record_tool_outcome(
-                                ct_item["fn"],
-                                not self._looks_like_tool_failure(ct_item["fn"], "", res),
-                            )
+                    results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
+                    for ct_item, res in results:
+                        self._record_tool_outcome(
+                            ct_item["fn"],
+                            not self._looks_like_tool_failure(ct_item["fn"], "", res),
+                        )
+                        self._openai_messages.append(
+                            {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
+                else:
+                    for ct in batch["items"]:
+                        if not ct["allowed"]:
                             self._openai_messages.append(
-                                {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
-                    else:
-                        for ct in batch["items"]:
-                            if not ct["allowed"]:
-                                self._openai_messages.append(
-                                    {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
-                                continue
+                                {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
+                            continue
 
-                            raw = await self._execute_tool_call(ct["fn"], ct["inp"])
-                            raw = _safe_utf8_text(raw)
-                            res = self._persist_large_result(ct["fn"], raw)
-                            print_tool_result(ct["fn"], res)
-                            self._record_tool_outcome(
-                                ct["fn"],
-                                not self._looks_like_tool_failure(ct["fn"], raw, res),
-                            )
+                        raw = await self._execute_tool_call(ct["fn"], ct["inp"])
+                        raw = _safe_utf8_text(raw)
+                        res = self._persist_large_result(ct["fn"], raw)
+                        print_tool_result(ct["fn"], res)
+                        self._record_tool_outcome(
+                            ct["fn"],
+                            not self._looks_like_tool_failure(ct["fn"], raw, res),
+                        )
 
-                            if self._context_cleared:
-                                self._context_cleared = False
-                                self._openai_messages.append({"role": "user", "content": res})
-                                oai_context_break = True
-                                break
+                        if self._context_cleared:
+                            self._context_cleared = False
+                            self._openai_messages.append({"role": "user", "content": res})
+                            oai_context_break = True
+                            break
 
-                            self._openai_messages.append(
-                                {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
+                        self._openai_messages.append(
+                            {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
 
             self._context_cleared = False
             self._refresh_runtime_system_prompt()

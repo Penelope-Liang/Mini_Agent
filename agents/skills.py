@@ -190,24 +190,7 @@ def build_skill_descriptions() -> str:
     return "\n".join(lines)
 
 
-_TOKEN_RE = re.compile(r"[a-zA-Z0-9]+|[\u4e00-\u9fff]{1,2}")
-_STOP_TOKENS = {
-    "请帮",
-    "帮我",
-    "我做",
-    "做一",
-    "一次",
-    "一下",
-    "这个",
-    "那个",
-    "一个",
-    "用户",
-    "问题",
-    "回答",
-    "生成",
-    "使用",
-    "需要",
-}
+_TOKEN_RE = re.compile(r"[a-zA-Z0-9]+")
 
 
 def _tokens(text: str) -> set[str]:
@@ -218,22 +201,15 @@ def _tokens(text: str) -> set[str]:
         if len(token) > 3 and token.endswith("s"):
             expanded.add(token[:-1])
     found = expanded
-    cjk = re.findall(r"[\u4e00-\u9fff]+", raw)
-    for chunk in cjk:
-        if len(chunk) >= 2:
-            found.update(chunk[i : i + 2] for i in range(len(chunk) - 1))
-    return {x for x in found if x.strip() and x not in _STOP_TOKENS}
+    return {x for x in found if x.strip()}
 
 
 def _token_list(text: str) -> list[str]:
     raw = str(text or "").lower().replace("_", " ").replace("-", " ")
     tokens = [m.group(0) for m in _TOKEN_RE.finditer(raw)]
-    for chunk in re.findall(r"[\u4e00-\u9fff]+", raw):
-        if len(chunk) >= 2:
-            tokens.extend(chunk[i : i + 2] for i in range(len(chunk) - 1))
     expanded: list[str] = []
     for token in tokens:
-        if not token.strip() or token in _STOP_TOKENS:
+        if not token.strip():
             continue
         expanded.append(token)
         if len(token) > 3 and token.endswith("s"):

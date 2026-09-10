@@ -39,7 +39,7 @@ def _parse_json_object(text: str) -> dict[str, Any]:
 
 
 def _normalize_identity(text: str) -> str:
-    raw = re.sub(r"[^a-zA-Z0-9\u4e00-\u9fff]+", " ", str(text or "").lower())
+    raw = re.sub(r"[^a-zA-Z0-9]+", " ", str(text or "").lower())
     return re.sub(r"\s+", " ", raw).strip()
 
 
@@ -63,7 +63,7 @@ def _coerce_candidate(obj: dict[str, Any]) -> OnlineSkillCandidate | None:
         return None
     tags_raw = obj.get("tags") or []
     if isinstance(tags_raw, str):
-        tags = [part.strip() for part in re.split(r"[,，]", tags_raw) if part.strip()]
+        tags = [part.strip() for part in tags_raw.split(",") if part.strip()]
     elif isinstance(tags_raw, list):
         tags = [str(part).strip() for part in tags_raw if str(part).strip()]
     else:
