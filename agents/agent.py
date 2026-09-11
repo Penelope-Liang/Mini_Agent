@@ -102,6 +102,7 @@ def _get_context_windows(model:str)->int:
 # Prices move. Rather than editing this table, set MINIAGENT_PRICE_IN,
 # MINIAGENT_PRICE_CACHED or MINIAGENT_PRICE_OUT for the current model.
 MODEL_PRICES = {
+    "gpt-5.5": (5.00, 0.50, 30.00),
     "gpt-4o-mini": (0.15, 0.075, 0.60),
     "gpt-4o": (2.50, 1.25, 10.00),
     "claude-haiku": (1.00, 0.10, 5.00),
