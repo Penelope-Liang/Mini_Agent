@@ -95,23 +95,23 @@ def _get_context_windows(model:str)->int:
     return MODEL_CONTEXT.get(model, 200000)
 
 
-# USD per 1M tokens, as (input, output). Longest key wins, so "gpt-4o-mini"
-# is matched before "gpt-4o". Verified 2026-09-10 against the official pages:
+# USD per 1M tokens, as (input, cached input, output). Longest key wins, so
+# "gpt-4o-mini" is matched before "gpt-4o". Verified 2026-09-10 against:
 #   https://developers.openai.com/api/docs/pricing
 #   https://platform.claude.com/docs/en/about-claude/pricing
-# Prices move. Rather than editing this table, set MINIAGENT_PRICE_IN and
-# MINIAGENT_PRICE_OUT to override it for the current model.
+# Prices move. Rather than editing this table, set MINIAGENT_PRICE_IN,
+# MINIAGENT_PRICE_CACHED or MINIAGENT_PRICE_OUT for the current model.
 MODEL_PRICES = {
-    "gpt-4o-mini": (0.15, 0.60),
-    "gpt-4o": (2.50, 10.00),
-    "claude-haiku": (1.00, 5.00),
-    "claude-sonnet-5": (2.00, 10.00),
-    "claude-sonnet-4": (3.00, 15.00),
-    "claude-opus": (5.00, 25.00),
+    "gpt-4o-mini": (0.15, 0.075, 0.60),
+    "gpt-4o": (2.50, 1.25, 10.00),
+    "claude-haiku": (1.00, 0.10, 5.00),
+    "claude-sonnet-5": (2.00, 0.20, 10.00),
+    "claude-sonnet-4": (3.00, 0.30, 15.00),
+    "claude-opus": (5.00, 0.50, 25.00),
 }
 # Models outside the table are estimated high, so --max-cost stops early
 # rather than overspending on a model that turns out to be expensive.
-FALLBACK_PRICE = (3.00, 15.00)
+FALLBACK_PRICE = (3.00, 0.30, 15.00)
 
 
 # Multi-tier compression constants
@@ -180,6 +180,8 @@ class Agent:
         self.session_start_time= time.strftime("%Y-%m-%dT%H:%M:%SZ",time.gmtime())
 
         self.total_input_tokens = 0
+        # Subset of total_input_tokens that was served from the provider's prompt cache.
+        self.total_cached_input_tokens = 0
         self.total_output_tokens = 0
         self.last_input_token_count = 0
         self.current_turns = 0
@@ -413,7 +415,8 @@ class Agent:
             return "plan"
 
     def get_token_usage(self) -> dict:
-        return {"input":self.total_input_tokens, "output":self.total_output_tokens}
+        return {"input":self.total_input_tokens, "cached":self.total_cached_input_tokens,
+                "output":self.total_output_tokens}
 
     # Main entry point
 
@@ -471,6 +474,7 @@ class Agent:
     async def run_once(self, prompt:str)->None:
         self._output_buffer = []
         prev_in = self.total_input_tokens
+        prev_cached = self.total_cached_input_tokens
         prev_out = self.total_output_tokens
         await self.chat(prompt)
         text = "".join(self._output_buffer)
@@ -479,6 +483,7 @@ class Agent:
             "text": text,
             "tokens":{
                 "input":self.total_input_tokens-prev_in,
+                "cached":self.total_cached_input_tokens-prev_cached,
                 "output":self.total_output_tokens-prev_out
             },
         }
@@ -769,6 +774,7 @@ class Agent:
         if self.use_openai:
             self._openai_messages.append({"role": "system", "content":self._system_prompt})
         self.total_input_tokens = 0
+        self.total_cached_input_tokens = 0
         self.total_output_tokens = 0
         self.last_input_token_count = 0
         print_info("Conversation cleared.")
@@ -777,32 +783,37 @@ class Agent:
         total = self._get_current_cost_usd()
         budget_info = f" / ${self.max_cost_usd} budget" if self.max_cost_usd else ""
         turn_info = f" | Turns: {self.current_turns}/{self.max_turns}" if self.max_turns else ""
+        cached_info = f" ({self.total_cached_input_tokens} cached)" if self.total_cached_input_tokens else ""
         stats = self.tool_stats()
         tool_info = f"\n  Tools: {stats['success']}/{stats['calls']} succeeded ({stats['success_rate']:.1%})" if stats["calls"] else ""
         print_info(
-            f"Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out\n  Estimated cost: ${total:.4f}{budget_info}{turn_info}\n  Pricing: {self._pricing_label()}{tool_info}")
+            f"Tokens: {self.total_input_tokens} in{cached_info} / {self.total_output_tokens} out\n  Estimated cost: ${total:.4f}{budget_info}{turn_info}\n  Pricing: {self._pricing_label()}{tool_info}")
 
     # Per-1M token prices for the current model, plus where they came from.
-    def _model_prices(self) -> tuple[float, float, str]:
+    def _model_prices(self) -> tuple[float, float, float, str]:
         name = self.model.lower()
         source = next((k for k in sorted(MODEL_PRICES, key=len, reverse=True) if k in name), "")
-        price_in, price_out = MODEL_PRICES.get(source, FALLBACK_PRICE)
+        price_in, price_cached, price_out = MODEL_PRICES.get(source, FALLBACK_PRICE)
         source = source or "fallback (model not in price table)"
-        env_in, env_out = os.environ.get("MINIAGENT_PRICE_IN"), os.environ.get("MINIAGENT_PRICE_OUT")
-        if env_in or env_out:
-            price_in, price_out = float(env_in or price_in), float(env_out or price_out)
+        env = [os.environ.get(f"MINIAGENT_PRICE_{k}") for k in ("IN", "CACHED", "OUT")]
+        if any(env):
+            price_in, price_cached, price_out = (
+                float(v or d) for v, d in zip(env, (price_in, price_cached, price_out)))
             source = "env override"
-        return price_in, price_out, source
+        return price_in, price_cached, price_out, source
 
     # Shown wherever a cost appears, so an estimate is never mistaken for a real price.
     def _pricing_label(self) -> str:
-        price_in, price_out, source = self._model_prices()
-        return f"{source} ${price_in:g}/${price_out:g} per 1M"
+        price_in, price_cached, price_out, source = self._model_prices()
+        return f"{source} ${price_in:g}/${price_out:g} per 1M, cached ${price_cached:g}"
 
-    # Get current estimated cost
+    # Get current estimated cost. Cached input is a subset of total input.
     def _get_current_cost_usd(self) -> float:
-        price_in, price_out, _ = self._model_prices()
-        return (self.total_input_tokens / 1_000_000) * price_in + (self.total_output_tokens / 1_000_000) * price_out
+        price_in, price_cached, price_out, _ = self._model_prices()
+        uncached = self.total_input_tokens - self.total_cached_input_tokens
+        return ((uncached / 1_000_000) * price_in
+                + (self.total_cached_input_tokens / 1_000_000) * price_cached
+                + (self.total_output_tokens / 1_000_000) * price_out)
 
     # Check budget limits
     def _check_budget(self) -> dict:
@@ -1225,6 +1236,7 @@ class Agent:
             try:
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
                 self.total_input_tokens += sub_result["tokens"]["input"]
+                self.total_cached_input_tokens += sub_result["tokens"]["cached"]
                 self.total_output_tokens += sub_result["tokens"]["output"]
                 print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
                 return sub_result["text"] or "(Skill produced no output)"
@@ -1342,6 +1354,7 @@ class Agent:
         try:
             result = await sub_agent.run_once(prompt)
             self.total_input_tokens += result["tokens"]["input"]
+            self.total_cached_input_tokens += result["tokens"]["cached"]
             self.total_output_tokens += result["tokens"]["output"]
             print_sub_agent_end(agent_type, description)
             return result["text"] or "(Sub-agent produced no output)"
@@ -1429,9 +1442,15 @@ class Agent:
 
             # Record call timing and token usage for cost display and budget control.
             self.last_api_call_time = time.time()
-            self.total_input_tokens += response.usage.input_tokens
+            # Anthropic reports cache tokens outside input_tokens while OpenAI folds
+            # them in; normalise so total_input_tokens always means everything read.
+            cache_read = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+            read_tokens = (response.usage.input_tokens + cache_read
+                           + (getattr(response.usage, "cache_creation_input_tokens", 0) or 0))
+            self.total_input_tokens += read_tokens
+            self.total_cached_input_tokens += cache_read
             self.total_output_tokens += response.usage.output_tokens
-            self.last_input_token_count = response.usage.input_tokens
+            self.last_input_token_count = read_tokens
 
             # Extract tool_use blocks from mixed Anthropic response content.
             tool_uses = [b for b in response.content if b.type == "tool_use"]
@@ -1689,6 +1708,7 @@ class Agent:
 
             if response.get("usage"):
                 self.total_input_tokens += response["usage"]["prompt_tokens"]
+                self.total_cached_input_tokens += response["usage"]["cached_tokens"]
                 self.total_output_tokens += response["usage"]["completion_tokens"]
                 self.last_input_token_count = response["usage"]["prompt_tokens"]
 
@@ -1834,6 +1854,11 @@ class Agent:
                 if chunk.usage:
                     usage = {
                         "prompt_tokens": chunk.usage.prompt_tokens,
+                        # Only OpenAI's own endpoint reports this; compatible
+                        # providers omit it, which reads as "nothing cached".
+                        "cached_tokens": getattr(
+                            getattr(chunk.usage, "prompt_tokens_details", None),
+                            "cached_tokens", 0) or 0,
                         "completion_tokens": chunk.usage.completion_tokens,
                     }
 
@@ -1881,7 +1906,7 @@ class Agent:
                     },
                     "finish_reason": finish_reason or "stop",
                 }],
-                "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0},
+                "usage": usage or {"prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0},
             }
 
         return await _with_retry(_do)
