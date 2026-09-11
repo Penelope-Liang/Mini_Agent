@@ -95,6 +95,25 @@ def _get_context_windows(model:str)->int:
     return MODEL_CONTEXT.get(model, 200000)
 
 
+# USD per 1M tokens, as (input, output). Longest key wins, so "gpt-4o-mini"
+# is matched before "gpt-4o". Verified 2026-09-10 against the official pages:
+#   https://developers.openai.com/api/docs/pricing
+#   https://platform.claude.com/docs/en/about-claude/pricing
+# Prices move. Rather than editing this table, set MINIAGENT_PRICE_IN and
+# MINIAGENT_PRICE_OUT to override it for the current model.
+MODEL_PRICES = {
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (2.50, 10.00),
+    "claude-haiku": (1.00, 5.00),
+    "claude-sonnet-5": (2.00, 10.00),
+    "claude-sonnet-4": (3.00, 15.00),
+    "claude-opus": (5.00, 25.00),
+}
+# Models outside the table are estimated high, so --max-cost stops early
+# rather than overspending on a model that turns out to be expensive.
+FALLBACK_PRICE = (3.00, 15.00)
+
+
 # Multi-tier compression constants
 SNIP_THRESHOLD = 0.60
 AUTO_COMPACT_THRESHOLD = 0.70
@@ -213,6 +232,8 @@ class Agent:
         self._tool_error_streak: int = 0
         self._same_tool_repeat_count: int = 0
         self._last_tool_name: str = ""
+        # tool name -> [calls, successes], cumulative for the session
+        self._tool_stats: dict[str, list[int]] = {}
 
         # Build system prompt
         self._base_system_prompt = custom_system_prompt or build_system_prompt()
@@ -501,6 +522,9 @@ class Agent:
             self._openai_messages[0]["content"] = self._system_prompt
 
     def _record_tool_outcome(self, tool_name: str, success: bool) -> None:
+        stat = self._tool_stats.setdefault(tool_name, [0, 0])
+        stat[0] += 1
+        stat[1] += int(success)
         if tool_name == self._last_tool_name:
             self._same_tool_repeat_count += 1
         else:
@@ -510,6 +534,21 @@ class Agent:
             self._tool_error_streak = 0
         else:
             self._tool_error_streak += 1
+
+    def tool_stats(self) -> dict:
+        """Cumulative tool call counts and success rates for this session."""
+        calls = sum(c for c, _ in self._tool_stats.values())
+        success = sum(s for _, s in self._tool_stats.values())
+        return {
+            "calls": calls,
+            "success": success,
+            "failure": calls - success,
+            "success_rate": success / calls if calls else 0.0,
+            "by_tool": {
+                name: {"calls": c, "success": s, "success_rate": s / c}
+                for name, (c, s) in sorted(self._tool_stats.items())
+            },
+        }
 
     def _record_fold_event(self) -> None:
         self._fold_last_time = time.time()
@@ -726,6 +765,7 @@ class Agent:
         self._tool_error_streak = 0
         self._same_tool_repeat_count = 0
         self._last_tool_name = ""
+        self._tool_stats = {}
         if self.use_openai:
             self._openai_messages.append({"role": "system", "content":self._system_prompt})
         self.total_input_tokens = 0
@@ -737,17 +777,38 @@ class Agent:
         total = self._get_current_cost_usd()
         budget_info = f" / ${self.max_cost_usd} budget" if self.max_cost_usd else ""
         turn_info = f" | Turns: {self.current_turns}/{self.max_turns}" if self.max_turns else ""
+        stats = self.tool_stats()
+        tool_info = f"\n  Tools: {stats['success']}/{stats['calls']} succeeded ({stats['success_rate']:.1%})" if stats["calls"] else ""
         print_info(
-            f"Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out\n  Estimated cost: ${total:.4f}{budget_info}{turn_info}")
+            f"Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out\n  Estimated cost: ${total:.4f}{budget_info}{turn_info}\n  Pricing: {self._pricing_label()}{tool_info}")
 
-    # Get current estimated cost,
+    # Per-1M token prices for the current model, plus where they came from.
+    def _model_prices(self) -> tuple[float, float, str]:
+        name = self.model.lower()
+        source = next((k for k in sorted(MODEL_PRICES, key=len, reverse=True) if k in name), "")
+        price_in, price_out = MODEL_PRICES.get(source, FALLBACK_PRICE)
+        source = source or "fallback (model not in price table)"
+        env_in, env_out = os.environ.get("MINIAGENT_PRICE_IN"), os.environ.get("MINIAGENT_PRICE_OUT")
+        if env_in or env_out:
+            price_in, price_out = float(env_in or price_in), float(env_out or price_out)
+            source = "env override"
+        return price_in, price_out, source
+
+    # Shown wherever a cost appears, so an estimate is never mistaken for a real price.
+    def _pricing_label(self) -> str:
+        price_in, price_out, source = self._model_prices()
+        return f"{source} ${price_in:g}/${price_out:g} per 1M"
+
+    # Get current estimated cost
     def _get_current_cost_usd(self) -> float:
-        return (self.total_input_tokens / 1_000_000) * 3 + (self.total_output_tokens / 1_000_000) * 15
+        price_in, price_out, _ = self._model_prices()
+        return (self.total_input_tokens / 1_000_000) * price_in + (self.total_output_tokens / 1_000_000) * price_out
 
     # Check budget limits
     def _check_budget(self) -> dict:
-        if self.max_cost_usd is not None and self._get_current_cost_usd() >= self.max_cost_usd:
-            return {"exceeded": True, "reason": f"Cost limit reached (${self._get_current_cost_usd():.4f} >= ${self.max_cost_usd})"}
+        cost = self._get_current_cost_usd()
+        if self.max_cost_usd is not None and cost >= self.max_cost_usd:
+            return {"exceeded": True, "reason": f"Cost limit reached (${cost:.4f} >= ${self.max_cost_usd}, pricing: {self._pricing_label()})"}
         if self.max_turns is not None and self.current_turns >= self.max_turns:
             return {"exceeded": True, "reason": f"Turn limit reached ({self.current_turns} >= {self.max_turns})"}
         return {"exceeded": False}
@@ -1092,26 +1153,30 @@ class Agent:
     # Tool execution entry point
 
     async def _execute_tool_call(self, name: str, inp: dict) -> str:
-        if name == "compact_context":
-            return await self._execute_compact_context_tool(inp)
-        if name in ("enter_plan_mode", "exit_plan_mode"):
-            return await self._execute_plan_mode_tool(name)
-        if name == "agent":
-            return await self._execute_agent_tool(inp)
-        if name == "skill":
-            return await self._execute_skill_tool(inp)
+        # Never raises: tool failures come back as text so the model can react to them.
+        try:
+            if name == "compact_context":
+                return await self._execute_compact_context_tool(inp)
+            if name in ("enter_plan_mode", "exit_plan_mode"):
+                return await self._execute_plan_mode_tool(name)
+            if name == "agent":
+                return await self._execute_agent_tool(inp)
+            if name == "skill":
+                return await self._execute_skill_tool(inp)
             # Route MCP tool calls to the MCP manager
-        if self._mcp_manager.is_mcp_tool(name):
-            return await self._mcp_manager.call_tool(name, inp)
-        result = await execute_tool(name, inp, self._read_file_state)
-        if name in {"skill_create", "skill_evolve"}:
-            try:
-                parsed = json.loads(result)
-                if isinstance(parsed, dict) and parsed.get("ok"):
-                    self._refresh_runtime_system_prompt()
-            except Exception:
-                pass
-        return result
+            if self._mcp_manager.is_mcp_tool(name):
+                return await self._mcp_manager.call_tool(name, inp)
+            result = await execute_tool(name, inp, self._read_file_state)
+            if name in {"skill_create", "skill_evolve"}:
+                try:
+                    parsed = json.loads(result)
+                    if isinstance(parsed, dict) and parsed.get("ok"):
+                        self._refresh_runtime_system_prompt()
+                except Exception:
+                    pass
+            return result
+        except Exception as e:
+            return f"Error executing tool: {e}"
 
     async def _execute_compact_context_tool(self, inp: dict) -> str:
         reason = str(inp.get("reason") or "").strip()
@@ -1380,7 +1445,7 @@ class Agent:
             # No tool calls means the model finished; end this turn.
             if not tool_uses:
                 if not self.is_sub_agent:
-                    print_cost(self.total_input_tokens, self.total_output_tokens)
+                    print_cost(self.total_input_tokens, self.total_output_tokens, self._get_current_cost_usd())
                 break
 
             # With tool calls, execute tools and check turn/budget limits.
@@ -1418,10 +1483,7 @@ class Agent:
                 # If this tool started early during streaming, await it and collect the result.
                 early_task = early_executions.get(tu.id)
                 if early_task:
-                    try:
-                        raw = await early_task
-                    except Exception as e:
-                        raw = f"Error executing tool: {e}"
+                    raw = await early_task
                     raw = _safe_utf8_text(raw)
                     res = self._persist_large_result(tu.name, raw)
                     print_tool_result(tu.name, res)
@@ -1451,10 +1513,7 @@ class Agent:
                     self._confirmed_paths.add(perm["message"])
 
                 # After permission passes, execute the tool and persist large outputs as summaries.
-                try:
-                    raw = await self._execute_tool_call(tu.name, inp)
-                except Exception as e:
-                    raw = f"Error executing tool: {e}"
+                raw = await self._execute_tool_call(tu.name, inp)
                 raw = _safe_utf8_text(raw)
                 res = self._persist_large_result(tu.name, raw)
                 print_tool_result(tu.name, res)
@@ -1642,7 +1701,7 @@ class Agent:
 
             if not tool_calls:
                 if not self.is_sub_agent:
-                    print_cost(self.total_input_tokens, self.total_output_tokens)
+                    print_cost(self.total_input_tokens, self.total_output_tokens, self._get_current_cost_usd())
                 break
 
             self.current_turns += 1
@@ -1660,10 +1719,22 @@ class Agent:
                     continue
 
                 fn_name = tc["function"]["name"]
+                # Providers send "" when the call takes no arguments.
+                raw_args = (tc["function"].get("arguments") or "").strip()
                 try:
-                    inp = json.loads(tc["function"]["arguments"])
-                except Exception:
-                    inp = {}
+                    inp = json.loads(raw_args) if raw_args else {}
+                except json.JSONDecodeError as e:
+                    inp, bad_args = {}, f"not valid JSON ({e})"
+                else:
+                    bad_args = "" if isinstance(inp, dict) else "not a JSON object"
+
+                # Hand malformed arguments back to the model rather than running the tool with {}.
+                if bad_args:
+                    print_info(f"Invalid arguments for {fn_name}: {bad_args}")
+                    self._record_tool_outcome(fn_name, False)
+                    oai_checked.append({"tc": tc, "fn": fn_name, "inp": {}, "allowed": False,
+                                        "result": f"Arguments for {fn_name} were {bad_args}. Resend the call with a JSON object."})
+                    continue
 
                 print_tool_call(fn_name, inp)
 

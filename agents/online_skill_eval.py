@@ -1020,7 +1020,7 @@ async def _build_candidate_eval_bundle_async(
         ),
         reverse=True,
     )
-    best_variant, best_dev_eval, best_dev_summary = scored[0]
+    best_variant, _, best_dev_summary = scored[0]
     best_test_summary: dict[str, Any] = {}
     if test_samples:
         test_outputs, test_outcomes, test_eval = await _evaluate_generated_variant_async(

@@ -247,10 +247,20 @@ def _resolve_tool_path(raw_path: str, *, must_exist: bool = True) -> Path:
     return path
 
 
+# A NUL byte in the first 8 KB means binary, the same heuristic git uses.
+def _looks_binary(path: Path) -> bool:
+    with path.open("rb") as f:
+        return b"\x00" in f.read(8192)
+
+
 # Read a file and return its contents with line numbers
 def _read_file(inp:dict) -> str:
     try:
         path = _resolve_tool_path(inp["file_path"])
+        # Without this, read_text(errors="replace") turns a binary file into
+        # hundreds of thousands of replacement characters and reports success.
+        if _looks_binary(path):
+            return f"Binary file ({path.stat().st_size} bytes), not readable as text."
         content = path.read_text(errors="replace")
         lines = content.split("\n")
         numbered = "\n".join(f"{i + 1:4d} | {line}" for i, line in enumerate(lines))
@@ -334,6 +344,10 @@ def _generate_diff(old_content: str, old_string: str, new_string: str) -> str:
 def _edit_file(inp: dict) -> str:
     try:
         path = _resolve_tool_path(inp["file_path"])
+        # Editing decoded binary would write the replacement characters back
+        # and corrupt the file.
+        if _looks_binary(path):
+            return f"Binary file ({path.stat().st_size} bytes), cannot be edited as text."
         content = path.read_text(errors="replace")
 
         actual = _find_actual_string(content, inp["old_string"])
@@ -432,7 +446,10 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
             if include_pattern and not fnmatch.fnmatch(name, include_pattern):
                 continue
             try:
-                text = Path(full).read_text(errors="replace")
+                p = Path(full)
+                if _looks_binary(p):
+                    continue
+                text = p.read_text(errors="replace")
                 for i, line in enumerate(text.split("\n")):
                     if regex.search(line):
                         matches.append(f"{full}:{i+1}:{line}")
@@ -478,14 +495,6 @@ _activated_tools: set[str] = set()
 
 def reset_activated_tools() -> None:
     _activated_tools.clear()
-
-def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[ToolDef]:
-    tools = all_tools if all_tools is not None else tool_definitions
-    return [
-        {k: v for k, v in t.items() if k != "deferred"}
-        for t in tools
-        if not t.get("deferred") or t["name"] in _activated_tools
-    ]
 
 def get_deferred_tool_names(all_tools: list[ToolDef] | None = None) -> list[str]:
     tools = all_tools if all_tools is not None else tool_definitions
