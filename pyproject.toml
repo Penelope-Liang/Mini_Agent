@@ -1,0 +1,39 @@
+# This file exists to pin the lint baseline, not to package the project.
+# Without it, `ruff check` uses whatever defaults the installed ruff happens to
+# ship, so the same code reports a different number of problems on every
+# machine. Everything below is deliberately limited to [tool.ruff].
+
+[tool.ruff]
+target-version = "py312"
+exclude = ["archive", "data", "temp_*.py"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # import sorting
+    "B",    # bugbear
+    "BLE",  # blind except (see the note at the bottom of this file)
+    "SIM",  # simplifiable code
+    "UP",   # outdated syntax
+    "S",    # security / silently swallowed exceptions
+    "RUF",  # ruff-specific
+    "LOG",  # logging misuse
+    "DTZ",  # naive datetimes
+    "EXE",  # shebang / executable bit
+]
+ignore = [
+    # The longest lines in this repo are prompt literals in prompt.py, up to
+    # 912 characters. Wrapping them makes the prompts harder to read, and line
+    # length is a formatting preference rather than a correctness signal.
+    "E501",
+]
+
+# BLE001 (blind `except Exception`) is deliberately left enabled even though it
+# currently reports 66 hits. Some of them are correct: the agent catches broadly
+# at boundaries such as tool execution and sub-agent calls, and turns the failure
+# into text the model can act on. Others hide real failures with a bare `pass`.
+# Silencing the rule globally would grant an exemption to both kinds forever, so
+# the hits are reviewed case by case and marked with `# noqa: BLE001` plus a
+# reason only where the broad catch is justified.
