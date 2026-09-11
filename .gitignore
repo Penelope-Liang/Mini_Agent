@@ -237,3 +237,6 @@ test_providers.py
 # Internal analysis artifacts (not learning material)
 analysis/
 analysis_progress.md
+
+# Local benchmark harnesses (GAIA / MBPP), kept out of the public repo
+temp_*.py
