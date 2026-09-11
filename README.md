@@ -1,21 +1,8 @@
 # Mini Agent
 
-A minimal, readable **agent runtime** in Python. You talk to it in a terminal; it reasons with a model, calls tools to read and change real files, checks permissions before acting, and remembers what it learned.
+Mini Agent is a AI agent runtime written in Python. It provides a terminal interface and supports OpenAI-compatible and Anthropic-compatible models, tool calling, permission controls, persistent memory, reusable Skills, context management, MCP integrations, and sub-agents.
 
-The model only decides *what* to do. The runtime decides *whether it is allowed* and actually does it: permission checks, tool execution, feeding results back, compacting long context, and persisting reusable experience.
-
-## Why Mini Agent
-
-Most agent examples stop at "call a model, print the reply". The interesting and difficult part is everything around the model — the harness.
-
-Mini Agent exists to make that harness small enough to read in an afternoon, but complete enough to be real:
-
-- One clear agent loop instead of a framework you have to reverse-engineer.
-- Real execution boundaries: tools run under a permission mode, not on trust.
-- Long-horizon support: sessions are saved, and long context is folded into structured memory instead of being truncated blindly.
-- Capabilities that accumulate: reusable working methods are stored as Skills and can be refined from your feedback.
-
-It is meant to be run, read, and extended — as a base for a personal agent, a project-analysis assistant, or a domain-specific agent.
+The project provides a compact implementation of the main components used in an agent system. It can be used to study agent architecture, test orchestration and evaluation methods, or build agents for specific projects and workflows.
 
 ## Features
 
