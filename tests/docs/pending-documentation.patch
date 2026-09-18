@@ -1,0 +1,85 @@
+diff --git a/README.md b/README.md
+index 5435342..afb11fe 100644
+--- a/README.md
++++ b/README.md
+@@ -99,13 +99,7 @@ Skills are discovered from directories — one directory per Skill, containing a
+ ~/.miniagent/skills/<skill_name>/SKILL.md           # user-level, takes priority
+ ```
+ 
+-This repository ships one example, `code_review`:
+-
+-```text
+-.miniagent/skills/code_review/SKILL.md
+-```
+-
+-Skills are optional — the runtime works with none installed. Adding one requires no code changes.
++Bundled Skills: `code_review` for code review and `ops-troubleshooting` for read-only incident diagnosis. Skills are optional; adding one requires no code changes.
+ 
+ Mini Agent can also refine Skills from your feedback. When you state a durable rule (not a one-off request), it can add a new Skill or merge the rule into an existing one, recording where the change came from. See [docs/skill-evolution.md](docs/skill-evolution.md).
+ 
+@@ -168,3 +162,18 @@ Original contributions that Penelope Liang has the right to license are
+ available under the [MIT License](LICENSE). This does not cover inherited
+ code or third-party materials, including `data/`.
+ The inherited code's licensing status remains unresolved.
++
++## Reproducible permission demo (no model calls)
++
++```bash
++.venv/bin/python -m unittest discover -s tests -v
++.venv/bin/python -m examples.permissions_demo
++```
++
++The demo loads `ops-troubleshooting/SKILL.md`, creates a fork, reads simulated incident files, and rejects unauthorized writes and shell execution. It replaces the model loop with a fixed script. Results, file hashes, and permission audit events are written to `artifacts/permissions/`.
++
++See [permission verification and résumé wording](docs/permissions-verification.md) for tested guarantees and limitations. This is a local execution-layer test, not an AgentDojo score or a production incident benchmark.
++
++### AgentDojo pilot
++
++The optional [AgentDojo adapter](docs/agentdojo-evaluation.md) runs official banking tasks and prompt-injection attacks through MiniAgent's permission gate, with official scoring. Use the separate environment described there; `--run` enables paid model calls.
+diff --git a/docs/getting-started.md b/docs/getting-started.md
+index 3e873c2..f8b6311 100644
+--- a/docs/getting-started.md
++++ b/docs/getting-started.md
+@@ -123,7 +123,7 @@ The second volume matters. Sessions, long-term memory, and user-level Skills liv
+ | Option | Effect |
+ |--------|--------|
+ | `--plan` | Plan mode: analyze and describe changes without executing them |
+-| `--accept-edits` | Auto-approve file edits, still confirm dangerous shell commands |
++| `--accept-edits` | Auto-approve file edits, still confirm shell commands |
+ | `--yolo`, `-y` | Skip all confirmation prompts |
+ | `--dont-ask` | Auto-deny anything that would need confirmation (useful in CI) |
+ | `--thinking` | Enable extended thinking (Anthropic only) |
+@@ -140,13 +140,13 @@ Every tool call is checked before it runs. Read-only tools (`read_file`, `list_f
+ 
+ | Mode | Flag | Behaviour |
+ |------|------|-----------|
+-| `default` | *(none)* | Ask before writing new files, editing missing files, dangerous shell commands, and Skill changes |
++| `default` | *(none)* | Ask before every file write/edit, shell command, Skill change, and unclassified external tool call |
+ | `plan` | `--plan` | Block writes and shell, except for the plan file and anything matched by an `allow` rule |
+-| `acceptEdits` | `--accept-edits` | Auto-approve file edits; dangerous shell still needs confirmation |
++| `acceptEdits` | `--accept-edits` | Auto-approve file edits; shell and unclassified external tools still need confirmation |
+ | `bypassPermissions` | `--yolo` | Allow everything without asking, including tools matched by a `deny` rule |
+ | `dontAsk` | `--dont-ask` | Deny anything that would otherwise prompt |
+ 
+-Shell commands are screened against a list of dangerous patterns (`rm`, `sudo`, `git push`, `git reset`, `kill`, `shutdown`, and similar), which trigger a confirmation prompt outside of `bypassPermissions`.
++Shell commands require approval regardless of whether the dangerous-pattern detector recognizes them. Explicit allow rules can preauthorize tools outside plan mode; bypassPermissions skips mode/rule checks. A fork’s tool whitelist still applies in every mode.
+ 
+ MiniAgent also refuses to write or edit a file that has not been read first, and warns if a file changed on disk since it was last read.
+ 
+diff --git a/docs/skill-evolution.md b/docs/skill-evolution.md
+index c8c708d..15cbf66 100644
+--- a/docs/skill-evolution.md
++++ b/docs/skill-evolution.md
+@@ -356,10 +356,11 @@ retrieved Skills
+ 
+ ## Observable state
+ 
+-This repository ships one general-purpose Skill with English instructions:
++This repository includes the following project Skills:
+ 
+ ```text
+ .miniagent/skills/code_review/SKILL.md
++.miniagent/skills/ops-troubleshooting/SKILL.md
+ ```
+ 
+ Audit artifacts under `.miniagent/skill-evolution/` are generated as you use MiniAgent and are excluded from version control:
