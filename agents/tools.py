@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -44,11 +45,13 @@ def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[
 tool_definitions: list[ToolDef] = [
     {
         "name": "read_file",
-        "description": "Read the contents of a file. Returns the file content with line numbers.",
+        "description": "Read a file with line numbers. For large files, use offset (1-based starting line) and limit (number of lines) to read the relevant section or continue after a truncated preview.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "The path to the file to read"},
+                "offset": {"type": "integer", "minimum": 1, "description": "Starting line, 1-based. Defaults to 1."},
+                "limit": {"type": "integer", "minimum": 1, "description": "Maximum number of lines to return. Omit to read to the end."},
             },
             "required": ["file_path"],
         },
@@ -231,20 +234,8 @@ tool_definitions: list[ToolDef] = [
 # ---------------------- Tool handlers ----------------------------
 
 def _resolve_tool_path(raw_path: str, *, must_exist: bool = True) -> Path:
-    path = Path(raw_path)
-    if path.exists() or not path.is_absolute():
-        return path
-
-    parts = path.parts
-    cwd = Path.cwd()
-    for i in range(1, len(parts)):
-        candidate = cwd.joinpath(*parts[i:])
-        if must_exist and candidate.exists():
-            return candidate
-        if not must_exist and candidate.parent.exists():
-            return candidate
-
-    return path
+    # Never reinterpret an absolute path as a different workspace file.
+    return Path(raw_path)
 
 
 # A NUL byte in the first 8 KB means binary, the same heuristic git uses.
@@ -256,6 +247,12 @@ def _looks_binary(path: Path) -> bool:
 # Read a file and return its contents with line numbers
 def _read_file(inp:dict) -> str:
     try:
+        offset = inp.get("offset", 1)
+        limit = inp.get("limit")
+        if type(offset) is not int or offset < 1:
+            return "Error reading file: offset must be a positive integer (1-based)."
+        if limit is not None and (type(limit) is not int or limit < 1):
+            return "Error reading file: limit must be a positive integer."
         path = _resolve_tool_path(inp["file_path"])
         # Without this, read_text(errors="replace") turns a binary file into
         # hundreds of thousands of replacement characters and reports success.
@@ -263,7 +260,13 @@ def _read_file(inp:dict) -> str:
             return f"Binary file ({path.stat().st_size} bytes), not readable as text."
         content = path.read_text(errors="replace")
         lines = content.split("\n")
-        numbered = "\n".join(f"{i + 1:4d} | {line}" for i, line in enumerate(lines))
+        start = offset - 1
+        end = len(lines) if limit is None else min(start + limit, len(lines))
+        if start >= len(lines):
+            return f"End of file: {len(lines)} lines; requested offset {offset}."
+        numbered = "\n".join(f"{i:4d} | {line}" for i, line in enumerate(lines[start:end], start=offset))
+        if end < len(lines):
+            numbered += f"\n[More lines available. Continue with offset={end + 1}, limit={limit}.]"
         return numbered
     except Exception as e:
         return f"Error reading file: {e}"
@@ -368,6 +371,62 @@ def _edit_file(inp: dict) -> str:
         return f"Successfully edited {inp['file_path']}{quote_note}\n\n{diff}"
     except Exception as e:
         return f"Error editing file: {e}"
+
+
+# ---------------- Approval scoped to one proposed change ------------------
+# A confirmation answers "may this exact edit run?", so an approval records the
+# hash of the contents it was based on. Execution recomputes that hash and
+# refuses when it moved, the way Terraform refuses a stale saved plan. Any
+# movement voids the approval; whether it was "relevant" is never guessed.
+
+def current_content_hash(path: Path) -> str | None:
+    """Hash of the file as it exists now, or None when there is no file."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def build_write_proposal(tool_name: str, inp: dict) -> dict | None:
+    """The exact change a write tool would make, or None if unpredictable."""
+    display = inp.get("file_path")
+    if tool_name not in {"write_file", "edit_file"} or not isinstance(display, str):
+        return None
+    try:
+        path = _resolve_tool_path(display, must_exist=(tool_name == "edit_file"))
+        if tool_name == "write_file":
+            after = inp["content"]
+            diff = "\n".join(f"+ {line}" for line in after.split("\n")[:20])
+        else:
+            if _looks_binary(path):
+                return None
+            content = path.read_text(errors="replace")
+            actual = _find_actual_string(content, inp["old_string"])
+            if actual is None or content.count(inp["old_string"]) > 1:
+                return None
+            after = content.replace(actual, inp["new_string"], 1)
+            diff = _generate_diff(content, actual, inp["new_string"])
+    except (OSError, KeyError, TypeError):
+        return None
+    before, after_hash = current_content_hash(path), hashlib.sha256(after.encode()).hexdigest()
+    return {
+        "tool": tool_name, "path": str(path), "display_path": display,
+        "before_hash": before, "after_hash": after_hash,
+        "prompt": f"{tool_name}: {display}\n"
+                  f"  current:  {before[:12] if before else '(new file)'}\n"
+                  f"  proposed: {after_hash[:12]}\n\n{diff}",
+    }
+
+
+def stale_proposal_reason(proposal: dict) -> str | None:
+    """Why an approved change no longer applies, or None when it still does."""
+    now = current_content_hash(Path(proposal["path"]))
+    if now == proposal["before_hash"]:
+        return None
+    was, found = (h[:12] if h else "(no file)" for h in (proposal["before_hash"], now))
+    return (f"{proposal['display_path']} changed after it was approved ({was} -> {found}). "
+            "The approval covered the previous contents and is now void. Read the file "
+            "again and propose the change against what it contains now.")
 
 
 def _list_files(inp: dict) -> str:
@@ -628,58 +687,48 @@ def check_permission(
     plan_file_path: str | None = None,
 ) -> dict:
     """Returns {"action": "allow"|"deny"|"confirm", "message": ...}"""
+    # A destructive shell command always needs a human. This floor outranks
+    # bypassPermissions and allow rules, and a caller with no prompt turns the
+    # confirmation into a denial, so it stays closed when unattended.
+    dangerous_shell = tool_name == "run_shell" and is_dangerous(inp.get("command", ""))
+    dangerous_message = f"dangerous command: {inp.get('command', '')}"
+
     if mode == "bypassPermissions":
+        if dangerous_shell:
+            return {"action": "confirm", "message": dangerous_message}
         return {"action": "allow"}
 
     rule_result = _check_permission_rules(tool_name, inp)
     if rule_result == "deny":
         return {"action": "deny", "message": f"Denied by permission rule for {tool_name}"}
+    if mode == "plan":
+        file_path = inp.get("file_path")
+        if tool_name in {"write_file", "edit_file"} and file_path and plan_file_path:
+            target = _resolve_tool_path(file_path, must_exist=(tool_name == "edit_file"))
+            if target.resolve() == Path(plan_file_path).resolve():
+                return {"action": "allow"}
+        if tool_name not in READ_TOOLS | {"skill", "agent", "tool_search", "enter_plan_mode", "exit_plan_mode"}:
+            return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
+
+    if dangerous_shell:
+        if mode == "dontAsk":
+            return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {dangerous_message}"}
+        return {"action": "confirm", "message": dangerous_message}
+
     if rule_result == "allow":
         return {"action": "allow"}
-
-    if tool_name in READ_TOOLS:
+    if tool_name in READ_TOOLS | {"skill", "agent", "tool_search", "enter_plan_mode", "exit_plan_mode"}:
         return {"action": "allow"}
-
-    if mode == "plan":
-        if tool_name in EDIT_TOOLS:
-            file_path = inp.get("file_path") or inp.get("path")
-            if plan_file_path and file_path == plan_file_path:
-                return {"action": "allow"}
-            return {"action": "deny", "message": f"Blocked in plan mode: {tool_name}"}
-        if tool_name == "run_shell":
-            return {"action": "deny", "message": "Shell commands blocked in plan mode"}
-
-    if tool_name in ("enter_plan_mode", "exit_plan_mode"):
-        return {"action": "allow"}
-
     if mode == "acceptEdits" and tool_name in EDIT_TOOLS:
         return {"action": "allow"}
 
-    needs_confirm = False
-    confirm_message = ""
+    # Shell and unclassified external tools are not assumed to be read-only.
+    target = inp.get("file_path") or inp.get("skill_name") or inp.get("name") or ""
+    confirm_message = f"{tool_name}: {inp.get('command', target)}"
 
-    if tool_name == "run_shell" and is_dangerous(inp.get("command", "")):
-        needs_confirm = True
-        confirm_message = inp.get("command", "")
-    elif tool_name == "write_file" and not _resolve_tool_path(inp.get("file_path", ""), must_exist=False).exists():
-        needs_confirm = True
-        confirm_message = f"write new file: {inp.get('file_path', '')}"
-    elif tool_name == "edit_file" and not _resolve_tool_path(inp.get("file_path", "")).exists():
-        needs_confirm = True
-        confirm_message = f"edit non-existent file: {inp.get('file_path', '')}"
-    elif tool_name == "skill_evolve":
-        needs_confirm = True
-        confirm_message = f"evolve skill: {inp.get('skill_name', '')}"
-    elif tool_name == "skill_create":
-        needs_confirm = True
-        confirm_message = f"create skill: {inp.get('name', '')}"
-
-    if needs_confirm:
-        if mode == "dontAsk":
-            return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {confirm_message}"}
-        return {"action": "confirm", "message": confirm_message}
-
-    return {"action": "allow"}
+    if mode == "dontAsk":
+        return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {confirm_message}"}
+    return {"action": "confirm", "message": confirm_message}
 
 
 
@@ -694,7 +743,7 @@ async def execute_tool(
 ) -> str:
     if name == "read_file":
         result = _read_file(inp)
-        if read_file_state is not None and not result.startswith("Error"):
+        if read_file_state is not None and not result.startswith(("Error", "Binary file", "End of file")):
             abs_path = str(_resolve_tool_path(inp["file_path"]).resolve())
             try:
                 read_file_state[abs_path] =  os.path.getmtime(abs_path)
@@ -773,7 +822,7 @@ async def execute_tool(
     result = _truncate_result(handler(inp))
 
     # Update read timestamp
-    if name in ("write_file", "edit_file") and read_file_state is not None and not result.startswith("Error"):
+    if name in ("write_file", "edit_file") and read_file_state is not None and not result.startswith(("Error", "Binary file", "End of file")):
         abs_path = str(_resolve_tool_path(inp["file_path"], must_exist=False).resolve())
         try:
             read_file_state[abs_path] = os.path.getmtime(abs_path)
@@ -787,6 +836,5 @@ async def execute_tool(
 def reset_permission_cache() -> None:
     global _cached_rules
     _cached_rules = None
-
 
 

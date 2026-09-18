@@ -29,7 +29,7 @@ from agents.session_memory import (
 from agents.session import save_folded_session_memory, save_session
 from agents.subagent import get_sub_agent_config
 from agents.tools import ToolDef, tool_definitions, execute_tool, CONCURRENCY_SAFE_TOOLS, check_permission, \
-    get_active_tool_definitions
+    get_active_tool_definitions, build_write_proposal, stale_proposal_reason, current_content_hash
 from agents.ui import print_info, print_divider, print_assistant_text, print_sub_agent_start, print_sub_agent_end, \
     start_spinner, stop_spinner, print_cost, print_tool_call, print_tool_result, print_confirmation, print_retry, \
     print_error
@@ -165,13 +165,16 @@ class Agent:
                  confirm_fn:Callable[[str], Awaitable[bool]] | None=None,
                  custom_system_prompt: str | None=None,
                  custom_tools: list[ToolDef] | None=None,
-                 is_sub_agent: bool=False,):
+                 is_sub_agent: bool=False,
+                 audit_path: str | None=None,):
         self.permission_mode = permission_mode
         self.thinking = thinking
         self.model = model
         self.use_openai = bool(api_base)
         self.is_sub_agent = is_sub_agent
-        self.tools = custom_tools or tool_definitions
+        self.tools = list(tool_definitions if custom_tools is None else custom_tools)
+        self._custom_tool_names = None if custom_tools is None else {t["name"] for t in custom_tools}
+        self.audit_path = Path(audit_path) if audit_path else Path.cwd() / ".miniagent" / "permission-audit.jsonl"
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
         self.confirm_fn = confirm_fn
@@ -192,14 +195,12 @@ class Agent:
         self._aborted = False
         # Store async task
         self._current_task:asyncio.Task | None = None
-        # Permission allowlist
-        self._confirmed_paths: set[str] = set()
 
 
         # Plan Mode state variables
         self._pre_plan_mode: str | None=None
         self._plan_file_path: str | None=None
-        self._plan_approval_fn : Callable[[str], Awaitable[bool]] | None=None
+        self._plan_approval_fn : Callable[[str], Awaitable[dict]] | None=None
         self._context_cleared : bool=False
 
         # Thinking mode
@@ -288,7 +289,6 @@ class Agent:
     # Generate absolute path for the AI plan Markdown file.
     def _generate_plan_file_path(self) -> str:
         d = Path.home() / ".miniagent" / "plans"
-        d.mkdir(parents=True, exist_ok=True)
         return str(d / f"plan-{self.session_id}.md")
 
     def _build_plan_mode_prompt(self) -> str:
@@ -376,7 +376,7 @@ class Agent:
     def set_confirm_fn(self, fn:Callable[[str], Awaitable[bool]]) -> None:
         self.confirm_fn = fn
 
-    def set_plan_approval_fn(self, fn:Callable[[str], Awaitable[bool]]) -> None:
+    def set_plan_approval_fn(self, fn:Callable[[str], Awaitable[dict]]) -> None:
         self._plan_approval_fn = fn
 
 
@@ -421,7 +421,7 @@ class Agent:
 
     # Main entry point
 
-    async def  chat(self, user_message:str)->None:
+    async def  chat(self, user_message:str, *, skill_query: str | None = None)->None:
         # Lazily load MCP services on first chat
         if not self._mcp_initialized and not self.is_sub_agent:
             self._mcp_initialized = True
@@ -429,7 +429,8 @@ class Agent:
                 await self._mcp_manager.load_and_connect()
                 mcp_defs = self._mcp_manager.get_tool_definitions()
                 if mcp_defs:
-                    self.tools = self.tools + mcp_defs
+                    self.tools = self.tools + [t for t in mcp_defs
+                                              if self._custom_tool_names is None or t["name"] in self._custom_tool_names]
             except Exception as e:
                 print_error(f"MCP init failed: {e}")
 
@@ -440,7 +441,7 @@ class Agent:
         if not self.is_sub_agent:
             ready_skill_extraction_window = self._pop_pending_skill_extraction_window(original_user_message)
             user_message, self._last_retrieved_skill_reference = self._augment_user_message_with_skill_context(
-                original_user_message
+                original_user_message, query=skill_query
             )
 
         self._aborted = False
@@ -571,11 +572,11 @@ class Agent:
             return True
         return False
 
-    def _augment_user_message_with_skill_context(self, user_message: str) -> tuple[str, dict[str, Any] | None]:
+    def _augment_user_message_with_skill_context(self, user_message: str, *, query: str | None = None) -> tuple[str, dict[str, Any] | None]:
         try:
             from .skills import format_retrieved_skill_context
 
-            context, top_ref = format_retrieved_skill_context(user_message, limit=3)
+            context, top_ref = format_retrieved_skill_context(query if query is not None else user_message, limit=3)
         except Exception:
             return user_message, None
         if top_ref and isinstance(top_ref.get("all_hits"), list):
@@ -815,6 +816,15 @@ class Agent:
         return ((uncached / 1_000_000) * price_in
                 + (self.total_cached_input_tokens / 1_000_000) * price_cached
                 + (self.total_output_tokens / 1_000_000) * price_out)
+
+    async def _dispatch_model_request(self, call, **kwargs):
+        """Count main-model dispatches, including failed calls and text-only replies.
+
+        This is telemetry, not a permission or budget gate. SDK-internal retries
+        remain part of the same dispatch; current_turns keeps its existing meaning.
+        """
+        self.model_requests = getattr(self, 'model_requests', 0) + 1
+        return await call(**kwargs)
 
     # Check budget limits
     def _check_budget(self) -> dict:
@@ -1158,13 +1168,59 @@ class Agent:
         return (
             f"[Result too large ({size_kb:.1f} KB, {len(lines)} lines). "
             f"Full output saved to {filepath}. "
-            f"You can use read_file to see the full result.]\n\n"
+            f"Only the first 200 lines are shown. Use read_file on the saved file "
+            f"with offset=201, limit=200 to continue, or read the relevant line range "
+            f"from the original source file. Do not reread the entire file without a line limit.]\n\n"
             f"Preview (first 200 lines):\n{preview}"
         )
 
     # Tool execution entry point
 
+    def _audit_permission(self, event: dict) -> None:
+        self.audit_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.audit_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+
     async def _execute_tool_call(self, name: str, inp: dict) -> str:
+        event = {"call_id": uuid.uuid4().hex, "session_id": self.session_id,
+                 "time": time.time(), "mode": self.permission_mode, "tool": name}
+        try:
+            if name not in {t["name"] for t in self.tools}:
+                permission = {"action": "deny", "message": "Tool outside allowed-tools"}
+            else:
+                permission = check_permission(name, inp, self.permission_mode, self._plan_file_path)
+            event.update(decision=permission["action"], reason=permission.get("message", ""))
+            allowed = permission["action"] == "allow"
+            proposal = None
+            if permission["action"] == "confirm":
+                # Approval is scoped to this change, so show it and record what it covered.
+                proposal = build_write_proposal(name, inp)
+                if proposal:
+                    event["proposal"] = {k: proposal[k] for k in ("path", "before_hash", "after_hash")}
+                allowed = await self._confirm_dangerous(
+                    proposal["prompt"] if proposal else permission["message"],
+                    "Approve this change" if proposal else "Dangerous command")
+                event["approved"] = allowed
+            # Persist authorization before executing; audit failure prevents execution.
+            self._audit_permission({**event, "phase": "authorization"})
+            if not allowed:
+                return f"Action denied: {permission.get('message', 'Approval refused')}"
+            stale = stale_proposal_reason(proposal) if proposal else None
+            if stale:
+                self._audit_permission({**event, "phase": "completion", "outcome": "stale-approval"})
+                return f"Action denied: {stale}"
+            result = await self._dispatch_tool_call(name, inp)
+            failed = result.startswith(("Error", "Warning:", "Action denied:", "Unknown"))
+            completion = {**event, "phase": "completion", "outcome": "failed" if failed else "completed"}
+            if proposal and not failed:
+                completion["wrote_approved_content"] = (
+                    current_content_hash(Path(proposal["path"])) == proposal["after_hash"])
+            self._audit_permission(completion)
+            return result
+        except Exception as exc:
+            return f"Error executing tool: {exc}"
+
+    async def _dispatch_tool_call(self, name: str, inp: dict) -> str:
         # Never raises: tool failures come back as text so the model can react to them.
         try:
             if name == "compact_context":
@@ -1215,15 +1271,9 @@ class Agent:
 
         # fork means the skill runs in a sub-agent instead of injecting its prompt inline
         if result["context"] == "fork":
-            # result["allowed_tools"] - direct access
-            tools = (
-                [t for t in self.tools if t["name"] in  result["allowed_tools"] ]
-                # result.get("allowed_tools") - safe access
-                # Key present: return the value (None, [], ["tool1"], etc.)
-                # Key absent: return None (no exception)
-                if result.get("allowed_tools")
-                else  [t for t in self.tools if t["name"] != "agent"]
-            )
+            allowed = result.get("allowed_tools")
+            tools = [t for t in self.tools if t["name"] != "agent"
+                     and (allowed is None or t["name"] in allowed)]
 
             print_sub_agent_start("skill-fork", inp.get("skill_name", ""))
             sub_agent = Agent(
@@ -1232,7 +1282,9 @@ class Agent:
                 custom_system_prompt=result["prompt"],
                 custom_tools=tools,
                 is_sub_agent=True,
-                permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+                permission_mode=self.permission_mode,
+                confirm_fn=self.confirm_fn,
+                audit_path=str(self.audit_path),
             )
             try:
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
@@ -1267,8 +1319,10 @@ class Agent:
                 plan_content = self._plan_file_path
             # Interactive approval flow when an approval function is set
             if self._plan_approval_fn:
-                result = self._plan_approval_fn(plan_content)
-                choice = result.get("choice", "manual-execute")
+                result = await self._plan_approval_fn(plan_content)
+                choice = result.get("choice", "keep-planning")
+                if choice not in {"keep-planning", "clear-and-execute", "execute", "manual-execute"}:
+                    return "Action denied: invalid plan approval."
 
                 if choice =="keep-planning":
                     feedback = result.get("feedback") or "Please revise the plan."
@@ -1278,15 +1332,15 @@ class Agent:
                         f"Please revise your plan based on this feedback. When done, call exit_plan_mode again."
                     )
 
-                if choice == "clear-and-execute":
-                    target_mode = "acceptEdits"
-                elif choice == "execute":
-                    target_mode = "acceptEdits"
+                if choice in {"clear-and-execute", "execute"}:
+                    # Approving a plan is not approving its edits: each one is
+                    # still confirmed against the file it was proposed against.
+                    target_mode = "default"
                 else:  # manual-execute
                     target_mode = self._pre_plan_mode or "default"
 
                 # Exit plan mode
-                self._pre_plan_mode = target_mode
+                self.permission_mode = target_mode
                 self._pre_plan_mode = None
                 saved_plan_path = self._plan_file_path
                 self._plan_file_path = None
@@ -1310,16 +1364,7 @@ class Agent:
                     f"## Approved Plan:\n{plan_content}\n\n"
                     f"Proceed with implementation."
                 )
-            # Fallback when no approval function is set (e.g. sub-agent)
-            self.permission_mode = self._pre_plan_mode or "default"
-            self._pre_plan_mode = None
-            self._plan_file_path = None
-            self._system_prompt = self._base_system_prompt
-            if self.use_openai and self._openai_messages:
-                self._openai_messages[0]["content"] = self._system_prompt
-
-            print_info("Exited plan mode. Restored to " + self.permission_mode + " mode.")
-            return f"Exited plan mode. Permission mode restored to: {self.permission_mode}\n\n## Your Plan:\n{plan_content}"
+            return "Action denied: exiting plan mode requires explicit user approval."
 
         return f"Unknown plan mode tool: {name}"
 
@@ -1348,9 +1393,11 @@ class Agent:
             model=self.model,
             api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
             custom_system_prompt=config["system_prompt"],
-            custom_tools=config["tools"],
+            custom_tools=[t for t in config["tools"] if t["name"] in {p["name"] for p in self.tools}],
             is_sub_agent=True,
-            permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+            permission_mode=self.permission_mode,
+            confirm_fn=self.confirm_fn,
+            audit_path=str(self.audit_path),
         )
         try:
             result = await sub_agent.run_once(prompt)
@@ -1437,7 +1484,7 @@ class Agent:
 
 
             # Call Anthropic streaming API; completed tool blocks trigger _on_tool_block.
-            response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
+            response = await self._dispatch_model_request(self._call_anthropic_stream, on_tool_block_complete=_on_tool_block)
             if not self.is_sub_agent:
                 stop_spinner()
 
@@ -1511,28 +1558,6 @@ class Agent:
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
                     continue
 
-                # Otherwise run permission checks before execution.
-
-                perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
-                if perm["action"] == "deny":
-                    # On denial, still return a tool_result explaining why the call failed.
-                    print_info(f"Denied: {perm.get('message', '')}")
-                    self._record_tool_outcome(tu.name, False)
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
-                                         "content": f"Action denied: {perm.get('message', '')}"})
-                    continue
-
-                if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
-                    # Dangerous actions require confirmation; cache confirmed messages to avoid repeats.
-                    confirmed = await self._confirm_dangerous(perm["message"])
-                    if not confirmed:
-                        self._record_tool_outcome(tu.name, False)
-                        tool_results.append(
-                            {"type": "tool_result", "tool_use_id": tu.id, "content": "User denied this action."})
-                        continue
-                    self._confirmed_paths.add(perm["message"])
-
-                # After permission passes, execute the tool and persist large outputs as summaries.
                 raw = await self._execute_tool_call(tu.name, inp)
                 raw = _safe_utf8_text(raw)
                 res = self._persist_large_result(tu.name, raw)
@@ -1700,7 +1725,7 @@ class Agent:
             if not self.is_sub_agent:
                 start_spinner()
 
-            response = await self._call_openai_stream()
+            response = await self._dispatch_model_request(self._call_openai_stream)
 
             if not self.is_sub_agent:
                 stop_spinner()
@@ -1759,22 +1784,6 @@ class Agent:
 
                 print_tool_call(fn_name, inp)
 
-                perm = check_permission(fn_name, inp, self.permission_mode, self._plan_file_path)
-
-                if perm["action"] == "deny":
-                    print_info(f"Denied: {perm.get('message', '')}")
-                    self._record_tool_outcome(fn_name, False)
-                    oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False,
-                                        "result": f"Action denied: {perm.get('message', '')}"})
-                    continue
-                if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
-                    confirmed = await self._confirm_dangerous(perm["message"])
-                    if not confirmed:
-                        self._record_tool_outcome(fn_name, False)
-                        oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False,
-                                            "result": "User denied this action."})
-                        continue
-                    self._confirmed_paths.add(perm["message"])
                 oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
 
             oai_batches: list[dict] = []
@@ -1912,10 +1921,12 @@ class Agent:
 
         return await _with_retry(_do)
 
-    async def _confirm_dangerous(self, command: str) -> bool:
-        print_confirmation(command)
+    async def _confirm_dangerous(self, command: str, title: str = "Dangerous command") -> bool:
+        print_confirmation(command, title)
         if self.confirm_fn:
             return await self.confirm_fn(command)
+        if self.is_sub_agent:
+            return False
         # Fallback: blocking input
         try:
             answer = input("  Allow? (y/n): ")

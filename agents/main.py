@@ -142,7 +142,8 @@ async def run_repl(agent: Agent) -> None:
             try:
                 choice = input("  Enter choice (1-4): ").strip()
             except EOFError:
-                return {"choice": "manual-execute"}
+                # Silence is not approval: stay read-only until the user says otherwise.
+                return {"choice": "keep-planning", "feedback": "No approval received; plan mode stays active."}
             if choice == "1":
                 return {"choice": "clear-and-execute"}
             elif choice == "2":
