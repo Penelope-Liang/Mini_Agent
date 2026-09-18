@@ -240,3 +240,11 @@ analysis_progress.md
 
 # Local benchmark harnesses (GAIA / MBPP), kept out of the public repo
 temp_*.py
+
+# Permission demonstration output and runtime audit
+.miniagent/permission-audit.jsonl
+artifacts/permissions/
+
+# Isolated AgentDojo environment and generated traces
+.venv-agentdojo/
+artifacts/agentdojo/

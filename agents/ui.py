@@ -143,10 +143,10 @@ def print_error(msg: str) -> None:
     ))
 
 
-def print_confirmation(command: str) -> None:
+def print_confirmation(command: str, title: str = "Dangerous command") -> None:
     console.print(Panel(
         _safe_text(command),
-        title="[bold yellow]Dangerous command[/bold yellow]",
+        title=f"[bold yellow]{title}[/bold yellow]",
         border_style="yellow",
         box=box.ROUNDED,
         padding=(0, 1),
