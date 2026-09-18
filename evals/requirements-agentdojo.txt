@@ -1,0 +1,3 @@
+# Pin the official benchmark source, tasks, attacks, and scoring code.
+agentdojo @ git+https://github.com/ethz-spylab/agentdojo.git@089ed468cf3ed0322acc66b0211f26d9d90dbf60
+-r ../requirements.txt
