@@ -27,6 +27,12 @@ Check for:
 
 Read the relevant files before making claims. If the user provides a file path, review that file directly. If the user provides a diff or describes a change, focus on the changed behavior and affected call sites.
 
+Treat initial suspicions as candidates. For each candidate, identify the exact source location, triggering input or state, concrete incorrect behavior, and supporting code. Diff line numbers are not source line numbers.
+
+Before reporting, try to disprove each candidate: inspect relevant callers, existing guards, documented contracts and tests. Follow references that could change the conclusion. If a file is truncated, read the relevant source range using `read_file` with `offset` and `limit`; a preview does not establish coverage of the whole file.
+
+Keep findings supported by a reachable failure, not merely a hypothetical concern. Drop claims contradicted by the code. Put unresolved candidates and missing context under open questions; do not promote them to confirmed bugs or claim the unreviewed code is safe. State whether tests were executed or only inspected.
+
 Do not list generic best practices unless they apply to the code being reviewed. If there are no clear issues, say so and mention any remaining test gaps or residual risk.
 
 ## Output Format
