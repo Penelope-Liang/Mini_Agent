@@ -245,6 +245,6 @@ temp_*.py
 .miniagent/permission-audit.jsonl
 artifacts/
 
-# Isolated AgentDojo environment and generated traces
+# Isolated AgentDojo environment and generated traces / scored run dumps
 .venv-agentdojo/
-evals/results/*-full.json
+evals/results/
