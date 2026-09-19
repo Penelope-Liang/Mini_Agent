@@ -148,6 +148,42 @@ class PermissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(approved['after_hash'], hashlib.sha256(b'timeout=500\n').hexdigest())
         self.assertTrue(next(e['wrote_approved_content'] for e in events if 'wrote_approved_content' in e))
 
+    async def test_approval_prompt_shows_the_arguments_of_a_non_file_tool(self):
+        # For a transaction the arguments are the change, so an approver that sees
+        # only the tool name is being asked to authorise something it cannot read.
+        agent = self.agent('default')
+        agent.tools.append({'name': 'send_money'})
+        agent._mcp_manager.call_tool = AsyncMock()
+        await agent._execute_tool_call('send_money', {'recipient': 'US133000000121212121212',
+                                                     'amount': 1000000, 'subject': 'Hacked!'})
+        prompt = agent.confirm_fn.await_args.args[0]
+        for expected in ('send_money', 'recipient=US133000000121212121212', 'amount=1000000', 'subject=Hacked!'):
+            self.assertIn(expected, prompt)
+
+    async def test_credentials_are_withheld_from_the_prompt_and_the_audit(self):
+        agent = self.agent('default')
+        agent.tools.append({'name': 'update_password'})
+        agent._mcp_manager.call_tool = AsyncMock()
+        await agent._execute_tool_call('update_password', {'password': 'hunter2-plaintext',
+                                                          'api_token': 'token-9f8e7d'})
+        prompt = agent.confirm_fn.await_args.args[0]
+        self.assertIn('update_password', prompt)
+        self.assertEqual(prompt.count('[REDACTED]'), 2)
+        for secret in ('hunter2-plaintext', 'token-9f8e7d'):
+            self.assertNotIn(secret, prompt)
+            self.assertNotIn(secret, self.audit.read_text())
+
+    async def test_refused_approval_never_reaches_a_non_file_tool(self):
+        agent = self.agent('default')
+        agent.tools.append({'name': 'send_money'})
+        agent._mcp_manager.call_tool = AsyncMock()
+        self.assertIn('Action denied:', await agent._execute_tool_call(
+            'send_money', {'recipient': 'US133000000121212121212', 'amount': 1000000}))
+        agent._mcp_manager.call_tool.assert_not_called()
+        events = [json.loads(line) for line in self.audit.read_text().splitlines()]
+        self.assertEqual([e['approved'] for e in events if 'approved' in e], [False])
+        self.assertFalse([e for e in events if e['phase'] == 'completion'])
+
     async def test_plan_approval_does_not_grant_blanket_edit_permission(self):
         agent = self.agent()
         agent._plan_approval_fn = AsyncMock(return_value={'choice': 'execute'})

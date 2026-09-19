@@ -243,8 +243,8 @@ temp_*.py
 
 # Permission demonstration output and runtime audit
 .miniagent/permission-audit.jsonl
-artifacts/permissions/
+artifacts/
 
 # Isolated AgentDojo environment and generated traces
 .venv-agentdojo/
-artifacts/agentdojo/
+evals/results/*-full.json
