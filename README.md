@@ -1,55 +1,58 @@
 # Mini Agent
 
-Mini Agent is a AI agent runtime written in Python. It provides a terminal interface and supports OpenAI-compatible and Anthropic-compatible models, tool calling, permission controls, persistent memory, reusable Skills, context management, MCP integrations, and sub-agents.
+Mini Agent is a Python agent runtime with a terminal interface. It works with OpenAI compatible and Anthropic compatible models, and covers tool calling, permission controls, long term memory, reusable Skills, context management, MCP integrations, and sub agents.
 
-The project provides a compact implementation of the main components used in an agent system. It can be used to study agent architecture, test orchestration and evaluation methods, or build agents for specific projects and workflows.
+Use it to study agent architecture, run orchestration and evaluation experiments, or build agents for a specific workflow.
 
 ## Features
 
-- **Agent loop** — model request, tool-call parsing, permission check, execution, result write-back, repeat until done.
-- **Dual protocol** — works with OpenAI-compatible and Anthropic-compatible endpoints.
-- **Tool system** — read, write, precise string-replace edit, glob listing, grep search, shell, sub-agents, and MCP tools.
-- **Permission control** — five modes from fully interactive to unattended, plus allow/deny rules; Plan Mode blocks writes and shell apart from what you pre-approve.
-- **Skills** — reusable working methods stored as `SKILL.md`, retrieved by relevance and injected into the request.
-- **Skill self-evolution** — durable rules extracted from explicit user feedback, then added to or merged into a Skill, with provenance and version snapshots.
-- **Long-term memory** — project-scoped facts, preferences, and decisions, isolated by project path hash.
-- **MCP integration** — a stdio JSON-RPC client that exposes external MCP server tools as `mcp__server__tool`.
-- **Sub-agents** — `explore`, `plan`, `general`, plus custom agents defined in Markdown.
-- **Session recovery and compaction** — auto-saved sessions, `--resume`, and `/compact`.
+- **Agent loop.** Model request, tool call parsing, permission check, execution, result write back, repeat until done.
+- **Dual protocol.** OpenAI compatible and Anthropic compatible endpoints.
+- **Tool system.** Read, write, precise string replace edit, glob listing, grep search, shell, sub agents, and MCP tools.
+- **Permission control.** Five modes (`plan`, `default`, `acceptEdits`, `dontAsk`, `bypassPermissions`), allow and deny rules, dangerous shell checks, read before edit, and mtime checks so a changed file must be re read before overwrite. Skill forks can further restrict tools with an `allowed-tools` allowlist.
+- **Tool call authorization.** Optional isolated approver (user request and proposed call only) and provenance ledger (arguments must match labeled values from the user request or structured tool results, or closed form derivations such as copy, difference, half split, and percent plus fee).
+- **Skills.** Reusable methods stored as `SKILL.md`, retrieved by relevance and injected into the request. Includes examples such as `code_review` and read only `ops-troubleshooting`.
+- **Skill self evolution.** Durable rules from explicit user feedback can be added or merged into a Skill, with records and version snapshots.
+- **Long term memory.** Project scoped facts and preferences, isolated by project path hash. Recall is injected by the runtime; the model can call `compact_context` to fold a long session.
+- **MCP integration.** Stdio JSON RPC client exposing external tools as `mcp__server__tool`.
+- **Sub agents.** `explore`, `plan`, `general`, plus custom agents defined in Markdown.
+- **Session recovery and compaction.** Auto saved sessions, `--resume`, and `/compact`.
+- **CI.** GitHub Actions runs unit tests and AgentDojo adapter tests on push and pull request.
 
 ## Architecture
 
-Six layers, each with a single job:
+Six layers, each with one job:
 
 | Layer | Main files | Responsibility |
 |-------|-----------|----------------|
-| Entry | `agents/main.py`, `agents/ui.py` | Argument parsing, REPL, one-shot runs, terminal output |
+| Entry | `agents/main.py`, `agents/ui.py` | Argument parsing, REPL, one shot runs, terminal output |
 | Harness | `agents/agent.py` | Agent loop, protocol adaptation, tool dispatch, compaction, session save |
-| Capability | `agents/tools.py`, `agents/skills.py`, `agents/memory.py`, `agents/mcp_client.py`, `agents/subagent.py` | Tools, Skills, Memory, MCP, sub-agents |
+| Capability | `agents/tools.py`, `agents/skills.py`, `agents/memory.py`, `agents/mcp_client.py`, `agents/subagent.py` | Tools, Skills, Memory, MCP, sub agents |
+| Authorization | `agents/approval.py`, `agents/provenance.py` | Isolated and provenance approvers for side effecting tool calls |
 | Prompt | `agents/prompt.py` | Dynamic system prompt construction |
-| Evolution | `agents/online_skill_evolution.py`, `agents/skill_evolution.py`, `agents/online_skill_eval.py` | Skill extraction, persistence, audit, evaluation |
+| Evolution | `agents/online_skill_evolution.py`, `agents/skill_evolution.py`, `agents/online_skill_eval.py` | Skill extraction, persistence, audit, Skill quality evaluation |
 | Persistence | `.miniagent/`, `~/.miniagent/` | Skills, Memory, sessions, audit artifacts, large tool results |
 
-One turn looks like this:
+One turn:
 
 ```text
 user input
   -> Agent.chat()
   -> build prompt, retrieve Skills, prefetch Memory, init MCP
-  -> call model (OpenAI-compatible or Anthropic-compatible)
+  -> call model (OpenAI compatible or Anthropic compatible)
   -> model returns text or a tool call
-  -> permission check
-  -> execute tool / Skill / MCP tool / sub-agent
+  -> permission check (and optional isolated or provenance approval)
+  -> execute tool / Skill / MCP tool / sub agent
   -> write result back to the model
   -> repeat until the model stops calling tools
   -> save session, track Skill usage, run online skill evolution
 ```
 
-See [docs/architecture.md](docs/architecture.md) for the detailed design.
+See [docs/architecture.md](docs/architecture.md) for the detailed design. Authorization and AgentDojo notes live under [tests/docs/](tests/docs/).
 
 ## Quick Start
 
-Requires Python 3.11+, and an OpenAI-compatible or Anthropic-compatible API endpoint. `ripgrep` is optional but makes search faster.
+Requires Python 3.11+ and an OpenAI compatible or Anthropic compatible API endpoint. `ripgrep` is optional but makes search faster.
 
 ```bash
 git clone <your-repo-url>
@@ -90,65 +93,101 @@ Full setup, environment variables, permission modes, and REPL commands are in [d
 
 ## Skills
 
-A Skill is a reusable working method written in Markdown: when to use it, how to approach the task, what the output should look like. The runtime retrieves relevant Skills and injects them into the request, so the agent follows a known-good method instead of improvising.
-
-Skills are discovered from directories — one directory per Skill, containing a file named exactly `SKILL.md`:
+A Skill is a reusable working method in Markdown: when to use it, how to approach the task, and what the output should look like. The runtime retrieves relevant Skills and injects them into the request.
 
 ```text
-<project>/.miniagent/skills/<skill_name>/SKILL.md   # project-level
-~/.miniagent/skills/<skill_name>/SKILL.md           # user-level, takes priority
+<project>/.miniagent/skills/<skill_name>/SKILL.md   # this project
+~/.miniagent/skills/<skill_name>/SKILL.md           # your user directory (wins on name clash)
 ```
 
-This repository ships one example, `code_review`:
+Shipped examples:
 
 ```text
 .miniagent/skills/code_review/SKILL.md
+.miniagent/skills/ops-troubleshooting/SKILL.md
 ```
 
-Skills are optional — the runtime works with none installed. Adding one requires no code changes.
-
-Mini Agent can also refine Skills from your feedback. When you state a durable rule (not a one-off request), it can add a new Skill or merge the rule into an existing one, recording where the change came from. See [docs/skill-evolution.md](docs/skill-evolution.md).
+`ops-troubleshooting` runs as a fork with a read tool allowlist for investigation without edits. Skills are optional. See [docs/skill-evolution.md](docs/skill-evolution.md).
 
 ## Evaluation
 
-Mini Agent includes a built-in evaluation pipeline for **Skill quality**: it replays historical conversations against the rules compiled from each `SKILL.md`, optionally using an LLM judge, and reports whether a Skill is actually being retrieved and used.
+### Skill quality
+
+Replay historical conversations against rules compiled from each `SKILL.md`, optionally with an LLM judge:
 
 ```bash
-python3 -m agents.online_skill_eval   # programmatic rules only
+python3 -m agents.online_skill_eval
 ```
 
-Or inside the REPL, which also enables the LLM judge:
+Or in the REPL: `/skill-eval`. Details: [docs/skills-evaluation.md](docs/skills-evaluation.md).
 
-```text
-/skill-eval
+### AgentDojo (tool calling security and utility)
+
+`evals/agentdojo.py` runs official AgentDojo suites through Mini Agent’s real permission and approval gate. It records per run:
+
+- task success (`utility`, summarized as PNA on clean tasks)
+- attack success rate (ASR)
+- utility under attack and NRP
+- latency, token usage, and estimated cost
+- approval and audit counters
+
+Install the pinned AgentDojo dependency, then for example:
+
+```bash
+pip install -r evals/requirements-agentdojo.txt
+PYTHONPATH=. python -m evals.agentdojo --run --suite banking \
+  --tasks user_task_0,user_task_1 \
+  --injections injection_task_0 \
+  --configs bypassPermissions:none:rules,default:isolated:mode-only,default:provenance:mode-only \
+  --output artifacts/agentdojo
 ```
 
-This measures Skills, not end-to-end task success. It is not a task benchmark such as GAIA or HLE, and this repository does not currently ship a harness for those. Details in [docs/skills-evaluation.md](docs/skills-evaluation.md).
+Scored JSON dumps under `evals/results/` and `artifacts/` stay local (gitignored). Narrative and limits: [tests/docs/agentdojo-evaluation.md](tests/docs/agentdojo-evaluation.md), [tests/docs/permissions-verification.md](tests/docs/permissions-verification.md).
+
+### Automated tests and CI
+
+```bash
+PYTHONPATH=. python -m unittest discover -s tests -v
+PYTHONPATH=. python -m unittest discover -s evals/tests -v
+```
+
+GitHub Actions runs the same suites on push and pull request (`.github/workflows/ci.yml`). Offline permission demo: `python -m examples.permissions_demo`.
 
 ## Project Structure
 
 ```text
 MiniAgent/
-├── agents/                 # the runtime
-│   ├── main.py             # CLI entry, REPL, argument parsing
-│   ├── agent.py            # agent loop, tool dispatch, compaction, session save
-│   ├── tools.py            # built-in tools and the permission system
-│   ├── prompt.py           # dynamic system prompt construction
-│   ├── skills.py           # Skill discovery, retrieval, execution
-│   ├── skill_evolution.py  # Skill persistence, version snapshots, audit
-│   ├── online_skill_evolution.py  # candidate extraction, add/merge/discard
-│   ├── online_skill_eval.py       # Skill quality evaluation
-│   ├── memory.py           # project-scoped long-term memory
-│   ├── mcp_client.py       # MCP stdio JSON-RPC client
-│   ├── subagent.py         # sub-agent configuration
-│   ├── session.py          # session save and recovery
-│   ├── session_memory.py   # structured session memory folding
-│   ├── frontmatter.py      # SKILL.md frontmatter parsing
-│   └── ui.py               # terminal output
-├── .miniagent/
-│   └── skills/             # project-level Skills
-├── docs/                   # documentation
-├── data/                   # third-party evaluation datasets
+├── agents/
+│   ├── main.py              # CLI entry, REPL
+│   ├── agent.py             # agent loop, tool dispatch, session
+│   ├── tools.py             # built in tools and permission modes
+│   ├── approval.py          # isolated and provenance approvers
+│   ├── provenance.py        # labeled values and sink matching
+│   ├── prompt.py
+│   ├── skills.py
+│   ├── skill_evolution.py
+│   ├── online_skill_evolution.py
+│   ├── online_skill_eval.py
+│   ├── memory.py
+│   ├── mcp_client.py
+│   ├── subagent.py
+│   ├── session.py
+│   ├── session_memory.py
+│   ├── frontmatter.py
+│   └── ui.py
+├── evals/
+│   ├── agentdojo.py         # AgentDojo adapter and runner
+│   ├── requirements-agentdojo.txt
+│   └── tests/               # adapter tests
+├── tests/                   # unit and permission or provenance tests
+│   └── docs/                # evaluation and authorization notes
+├── examples/
+│   └── permissions_demo.py
+├── .github/workflows/
+│   └── ci.yml
+├── .miniagent/skills/
+├── docs/
+├── data/
 ├── Dockerfile
 ├── requirements.txt
 └── .env.example
@@ -156,11 +195,14 @@ MiniAgent/
 
 ## Documentation
 
-- [Getting Started](docs/getting-started.md) — install, configure, run, permission modes, REPL commands
-- [Architecture](docs/architecture.md) — layers, agent loop, tools, Skills, Memory, MCP, sub-agents
-- [Source Code Guide](docs/source-code-guide.md) — a reading order through the codebase
-- [Skill Self-Evolution](docs/skill-evolution.md) — how Skills are extracted, merged, and audited
-- [Skills Evaluation](docs/skills-evaluation.md) — how Skill quality is measured
+- [Getting Started](docs/getting-started.md)
+- [Architecture](docs/architecture.md)
+- [Source Code Guide](docs/source-code-guide.md)
+- [Skill Self Evolution](docs/skill-evolution.md)
+- [Skills Evaluation](docs/skills-evaluation.md)
+- [AgentDojo evaluation notes](tests/docs/agentdojo-evaluation.md)
+- [Permission verification notes](tests/docs/permissions-verification.md)
+- [Authorization references](tests/docs/authorization-references.md)
 
 ## License
 
