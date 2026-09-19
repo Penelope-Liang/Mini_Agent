@@ -20,15 +20,8 @@ PermissionMode = str  # "default" | "plan" | "acceptEdits" | "bypassPermissions"
 READ_TOOLS = {"read_file", "list_files", "grep_search", "compact_context"}
 EDIT_TOOLS = {"write_file", "edit_file", "skill_evolve", "skill_create"}
 
-
 # Concurrency-safe tools can run in parallel (read-only, no side effects)
 CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search"}
-
-
-
-
-
-
 
 def get_active_tool_definitions(all_tools: list[ToolDef] | None = None) -> list[ToolDef]:
     """Filter and return active tool definitions, removing inactive deferred tools and metadata fields before API calls."""
@@ -387,6 +380,30 @@ def current_content_hash(path: Path) -> str | None:
         return None
 
 
+# An approver cannot judge what it cannot see. File edits get a diff below; every
+# other tool is described by its arguments, since for those the arguments *are*
+# the change. Credential values are withheld: showing them would put secrets in
+# the audit log, and no approval decision needs the secret itself.
+_SECRET_KEY_PARTS = ("password", "passwd", "secret", "token", "credential", "api_key", "apikey")
+
+
+def describe_call(tool_name: str, inp: dict) -> str:
+    """One-line-per-argument rendering of a proposed call, secrets withheld."""
+    head = inp.get("command") or inp.get("file_path") or inp.get("skill_name") or inp.get("name") or ""
+    shown = {"command", "file_path", "skill_name", "name"} if head else set()
+    lines = []
+    for key, value in inp.items():
+        if key in shown:
+            continue
+        if any(part in key.lower() for part in _SECRET_KEY_PARTS):
+            rendered = "[REDACTED]"
+        else:
+            text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+            rendered = f"{text[:200]}... ({len(text)} chars)" if len(text) > 200 else text
+        lines.append(f"  {key}={rendered}")
+    return "\n".join([f"{tool_name}: {head}".rstrip(), *lines])
+
+
 def build_write_proposal(tool_name: str, inp: dict) -> dict | None:
     """The exact change a write tool would make, or None if unpredictable."""
     display = inp.get("file_path")
@@ -723,8 +740,7 @@ def check_permission(
         return {"action": "allow"}
 
     # Shell and unclassified external tools are not assumed to be read-only.
-    target = inp.get("file_path") or inp.get("skill_name") or inp.get("name") or ""
-    confirm_message = f"{tool_name}: {inp.get('command', target)}"
+    confirm_message = describe_call(tool_name, inp)
 
     if mode == "dontAsk":
         return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {confirm_message}"}
