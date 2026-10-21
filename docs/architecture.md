@@ -1,5 +1,12 @@
 # Architecture
 
+> **Sandbox CLI:** `python -m agents.main` now creates a fresh Docker workspace per task and
+> exports changes outside the original repository. Build with
+> `docker build -t miniagent-sandbox:1 sandbox`. See the [current quick start](../README.md#quick-start)
+> for supported flags, snapshot exclusions, limits and results. The Skills/MCP/Memory and persistent
+> REPL descriptions below document the retained library runtime, not the isolated CLI.
+
+
 MiniAgent's core is the harness — the layer around the model.
 
 The model reasons and proposes tool-call intent. The runtime owns the real execution boundaries: permission checks, tool execution, result write-back, context management, session persistence, and Skill accumulation.
@@ -379,3 +386,68 @@ What it deliberately does not do:
 - It does not let the model rewrite its own instructions without evidence and an audit trail.
 - It does not hide capability behind a plugin framework; tools and Skills are plain definitions and Markdown files.
 - It does not ship a task benchmark harness; see [skills-evaluation.md](skills-evaluation.md) for what is actually measured.
+
+
+## Task-local stuck detection
+
+`agents/stuck_detector.py` implements bounded-pattern stopping independently of the framework,
+with OpenHands [StuckDetector](https://github.com/OpenHands/software-agent-sdk/blob/main/openhands-sdk/openhands/sdk/conversation/stuck_detector.py)
+as an architectural reference. This is a repetition heuristic, not proof that a task is unsolvable.
+
+Each Agent accepts `stuck_warn_at=3` and `stuck_stop_at=4` (positive integers, warning strictly before
+stopping). The third matching observation appends a corrective warning to the tool result; the fourth
+sets a stop reason and prevents further tool/model dispatch. These thresholds are inherited by both
+general sub-agents and Skill forks. Detection resets on a new `chat` task, never on context compaction.
+Existing tool statistics remain cumulative telemetry and do not control stopping.
+
+Three signals are checked:
+
+- Identical tool name, canonical JSON arguments, complete result fingerprint, and edit version.
+- Consecutive errors from the same call and version, even when error messages differ.
+- Permission denials accumulated within the task, separately from ordinary progress. Identical calls
+  use the normal thresholds; per-tool denial totals use twice those thresholds (6/8 by default) to
+  catch argument variations. Explicit human approval clears the matching call and that tool's denial
+  total. Denials of other calls remain recorded. Simple unquoted shell whitespace is normalized;
+  quoted strings, escapes and newlines retain their original semantics.
+
+Results carry `success`, `error` or `denied` metadata. Permission boundaries mark rejection explicitly;
+container shell status comes from the exit code, and file failures from worker errors. Older local
+string-only handlers use a compatibility adapter for their known error prefixes, not arbitrary
+substring matching of returned content. The detector fingerprints the full returned result before
+conversation truncation. Oversized shell output uses a fingerprint of the complete captured output.
+Only recognized pytest summary durations are normalized; arbitrary timestamps, paths and numbers
+are preserved. Stuck audit events contain tool name, pattern, count and action, never result/argument
+fingerprints or raw contents. Existing permission audit fields are separate.
+
+Actual file-tool content changes advance a task edit version shared with children. Failed or identical
+writes do not advance it. Successful no-op writes and context compaction have separate repetition
+counters and cannot erase the previous non-progress pattern. Reading different files or receiving
+changed results breaks the corresponding consecutive-result sequence.
+
+Both OpenAI-compatible and Anthropic loops collect observations in model tool-call order. Concurrent
+OpenAI batches and speculative Anthropic streaming calls may already be running when a stop is
+recognized; their outputs are drained and retained. No subsequent batch/model call is started. Tool
+result placeholders preserve protocol pairing for calls skipped after stopping.
+
+`run_once` returns `status` and `stop_reason` alongside text and tokens. Both child entry points return
+JSON containing these fields and partial text, allowing the parent to continue rather than treating a
+child stop as a task-wide exception. In sandbox CLI mode, a task is reported as completed only when
+`run_once` reports completion and the container is still available. When `run_once` returns normally
+after a stop (repetition detection or a budget/turn limit) and the container is still available, the
+existing patch is exported. On timeout, other exceptions, or after the container has been destroyed,
+only output already received is saved; no patch can be exported. A lost container is reported as
+`stop_reason: Sandbox unavailable`, including when a child agent caused it. In every case
+`result.json` keeps previous tool/test output and a non-completed status, and the container is cleaned
+up. The CLI exits unsuccessfully to distinguish a stopped task from completion; tests are not rerun at
+shutdown.
+
+Accepted limitations:
+
+- No A/B alternating-cycle detection. Unrelated real edits can advance the global edit version and
+  interrupt a result pattern; this is not a semantic measure of useful progress.
+- No complete tracking of filesystem changes caused by shell commands. Shell calls rely on returned
+  output and exit status; identical-output polling or silent filesystem changes can be misclassified.
+  Legitimate unchanged polling may stop on the fourth observation; raise thresholds when appropriate.
+- Error-prefix adaptation remains for legacy local handlers, and conservative normalization may miss
+  repetition involving changing timestamps or temporary paths. The detector does not establish that
+  every repeated operation is useless or that every non-repeated operation makes progress.

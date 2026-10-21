@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import os
 import signal
 import sys
@@ -25,7 +24,6 @@ from .ui import (
     print_skill_entries,
     print_warning,
 )
-from .session import load_session, get_latest_session_id
 from .memory import list_memories
 from .skills import (
     create_skill,
@@ -56,6 +54,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true", help="Resume last session")
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
+    parser.add_argument("--skill", action="append", default=[],
+                        help="Select project:NAME or user:NAME Skill (repeatable; inline only)")
+    parser.add_argument("--context7", action="store_true", help="Enable guarded external documentation queries")
+    parser.add_argument("--no-memory", action="store_true", help="Disable project-scoped read-only recall")
+    parser.add_argument("--workspace", default=".", help="Source repository to copy into the sandbox")
+    parser.add_argument("--sandbox-image", default="miniagent-sandbox:1", help="Prebuilt trusted execution image")
+    parser.add_argument("--output-dir", default=os.path.expanduser("~/.miniagent/sandbox-runs"),
+                        help="Host results directory, outside the source repository")
+    parser.add_argument("--task-timeout", type=float, default=600, help="Maximum task duration in seconds")
     parser.add_argument("--help", "-h", action="store_true", help="Show help")
     return parser.parse_args()
 
@@ -140,24 +147,18 @@ async def run_repl(agent: Agent) -> None:
         print_plan_approval_options()
         while True:
             try:
-                choice = input("  Enter choice (1-4): ").strip()
-            except EOFError:
-                # Silence is not approval: stay read-only until the user says otherwise.
-                return {"choice": "keep-planning", "feedback": "No approval received; plan mode stays active."}
-            if choice == "1":
-                return {"choice": "clear-and-execute"}
-            elif choice == "2":
-                return {"choice": "execute"}
-            elif choice == "3":
-                return {"choice": "manual-execute"}
-            elif choice == "4":
-                try:
+                choice = input("  Enter choice (1-3): ").strip()
+                if choice == "1":
+                    return {"choice": "execute"}
+                if choice == "3":
+                    return {"choice": "exit"}
+                if choice == "2":
                     feedback = input("  Feedback (what to change): ").strip()
-                except EOFError:
-                    feedback = ""
-                return {"choice": "keep-planning", "feedback": feedback or None}
-            else:
-                print_warning("Invalid choice. Enter 1, 2, 3, or 4.")
+                    if feedback:
+                        return {"choice": "keep-planning", "feedback": feedback}
+            except EOFError:
+                return {"choice": "exit"}
+            print_warning("Choose 1, 2, or 3; revision feedback must not be empty.")
 
     agent.set_plan_approval_fn(plan_approval_fn)
 
@@ -336,33 +337,31 @@ def main() -> None:
 MiniAgent
 Usage: python -m agents.main [options] [prompt]
 
+Each task runs in a fresh Docker sandbox; edits are exported, never applied to the source.
+Build first: docker build -t miniagent-sandbox:1 sandbox
+
 Options:
-  --yolo, -y          Skip all confirmation prompts (bypassPermissions mode)
+  --skill NAME        Load selected project:NAME or user:NAME Skill with container resources
+  --context7          Enable guarded Context7 queries (off by default)
+  --no-memory         Disable current-project read-only memory recall
+  --workspace PATH    Source repository (default: current directory)
+  --sandbox-image IMG Trusted prebuilt execution image (default: miniagent-sandbox:1)
+  --output-dir PATH   Results outside source (default: ~/.miniagent/sandbox-runs)
+  --task-timeout N    Total task deadline in seconds (default: 600)
+  --yolo, -y          Auto-allow ordinary tools; known dangerous commands still require approval
   --plan              Plan mode: read-only, describe changes without executing
-  --accept-edits      Auto-approve file edits, still confirm dangerous shell
+  --accept-edits      Auto-approve edits; shell commands still require approval
   --dont-ask          Auto-deny anything needing confirmation (for CI)
   --thinking          Enable extended thinking (Anthropic only)
   --model, -m         Model to use (default: deepseek-chat, or MODEL env)
   --api-base URL      Override API base URL from CLI or .env
-  --resume            Resume the last session
+  --resume            Unsupported in sandbox mode (fails explicitly)
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
   --help, -h          Show this help
 
-REPL commands:
-  /clear              Clear conversation history
-  /plan               Toggle plan mode (read-only <-> normal)
-  /cost               Show token usage and cost
-  /compact            Manually compact conversation
-  /memory             List saved memories
-  /skills             List available skills
-  /skill-stats        Show skill usage and evolution stats
-  /skill-eval         Evaluate online skill evolution quality
-  /extract_now        Extract the current pending online skill window: /extract_now [hint]
-  /skill-feedback     Record feedback: /skill-feedback <skill> <rating> [note]
-  /skill-evolve       Evolve a skill: /skill-evolve <skill> <durable lesson>
-  /skill-create       Create a skill: /skill-create <name> | <description> | <when-to-use> | <instructions>
-  /<skill-name>       Invoke a skill (e.g. /commit "fix types")
+Interactive mode: each entered task gets a fresh workspace and model context.
+Slash commands and --resume are not available in sandbox mode.
 
 Examples:
   python -m agents.main "fix the bug in src/app.ts"
@@ -371,7 +370,6 @@ Examples:
   python -m agents.main --max-cost 0.50 --max-turns 20 "implement feature X"
   MODEL=deepseek-chat APIKEY=sk-xxx API=https://api.deepseek.com/anthropic python -m agents.main "hello"
   MODEL=gpt-4o OPENAI_API_KEY=sk-xxx OPENAI_BASE_URL=https://your-host/v1 python -m agents.main "hello"
-  python -m agents.main --resume
   python -m agents.main  # starts interactive REPL
 """)
         sys.exit(0)
@@ -392,49 +390,13 @@ Examples:
         )
         sys.exit(1)
 
-    # Create the main Agent; OpenAI-compatible and Anthropic backends use different base URL params.
-    agent = Agent(
-        permission_mode=permission_mode,
-        model=model,
-        thinking=args.thinking,
-        max_cost_usd=args.max_cost,
-        max_turns=args.max_turns,
-        api_base=resolved_api_base if resolved_use_openai else None,
-        anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
-        api_key=resolved_api_key,
-    )
-
-    # Resume session
-    # --resume loads the latest session and restores history into the new Agent.
-    if args.resume:
-        session_id = get_latest_session_id()
-        if session_id:
-            session = load_session(session_id)
-            if session:
-                agent.restore_session({
-                    "anthropicMessages": session.get("anthropicMessages"),
-                    "openaiMessages": session.get("openaiMessages"),
-                })
-            else:
-                print_info("No session found to resume.")
-        else:
-            print_info("No previous sessions found.")
-
-    # Join trailing CLI text into a one-shot prompt, otherwise start the interactive REPL.
-    prompt = " ".join(args.prompt) if args.prompt else None
-
-    if prompt:
-        # One-shot mode
-        # One-shot mode: exit after running the user prompt.
-        try:
-            asyncio.run(run_one_shot(agent, prompt))
-        except Exception as e:
-            print_error(str(e))
-            sys.exit(1)
-    else:
-        # Interactive REPL
-        # Interactive mode: loop on user input until exit.
-        asyncio.run(run_repl(agent))
+    from .sandbox_cli import run_cli
+    args.model = model
+    try:
+        run_cli(args, resolved_api_base, resolved_api_key, resolved_use_openai, permission_mode)
+    except (Exception, KeyboardInterrupt) as exc:
+        print_error(str(exc) or "Task interrupted")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

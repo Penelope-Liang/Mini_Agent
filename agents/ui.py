@@ -244,13 +244,8 @@ def stop_spinner() -> None:
 
 
 def print_plan_for_approval(plan_content: str) -> None:
-    lines = plan_content.split("\n")
-    max_lines = 60
-    preview = "\n".join(lines[:max_lines])
-    if len(lines) > max_lines:
-        preview += f"\n\n... ({len(lines) - max_lines} more lines)"
     console.print(Panel(
-        _safe_text(preview),
+        _safe_text(plan_content),
         title="[bold cyan]Plan for Approval[/bold cyan]",
         border_style="cyan",
         box=box.ROUNDED,
@@ -263,10 +258,9 @@ def print_plan_approval_options() -> None:
     table.add_column("choice", style="bold yellow", no_wrap=True)
     table.add_column("action", style="white")
     table.add_column("detail", style="dim")
-    table.add_row("1", "Clear context and execute", "fresh start with auto-accept edits")
-    table.add_row("2", "Execute", "keep context, auto-accept edits")
-    table.add_row("3", "Manually approve edits", "keep context, confirm each edit")
-    table.add_row("4", "Keep planning", "provide feedback to revise")
+    table.add_row("1", "Approve & Execute", "default mode; tool permissions still apply")
+    table.add_row("2", "Revise Plan", "stay read-only and provide feedback")
+    table.add_row("3", "Exit Without Executing", "stop this task without approving")
     console.print(Panel(table, title="[bold yellow]Choose an option[/bold yellow]", border_style="yellow", box=box.ROUNDED))
 
 
@@ -283,9 +277,9 @@ def print_sub_agent_start(agent_type: str, description: str) -> None:
     ))
 
 
-def print_sub_agent_end(agent_type: str, _description: str) -> None:
+def print_sub_agent_end(agent_type: str, _description: str, status: str = "completed") -> None:
     console.print(Panel(
-        "completed",
+        status,
         title=f"[bold magenta]Sub-agent finished: {agent_type}[/bold magenta]",
         border_style="magenta",
         box=box.ROUNDED,

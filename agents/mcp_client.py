@@ -334,3 +334,114 @@ class McpManager:
         except Exception:
             # Skip malformed config files so one bad file does not break startup.
             pass
+
+
+class McpHttpConnection:
+    """Bounded Streamable HTTP client for a trusted fixed MCP endpoint.
+
+    Does not execute server requests, follow redirects, launch subprocesses, or
+    use environment proxies. Supports JSON and SSE POST responses only.
+    """
+
+    def __init__(self, endpoint: str, api_key: str = "", *, transport=None):
+        import httpx
+
+        headers = {"Accept": "application/json, text/event-stream"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        self._client = httpx.AsyncClient(
+            headers=headers, timeout=20, follow_redirects=False, trust_env=False, transport=transport)
+        self.endpoint = endpoint
+        self._next_id = 0
+        self._session = None
+
+    async def request(self, method: str, params: dict, *, notification=False):
+        self._next_id += 1
+        request_id = self._next_id
+        message = {"jsonrpc": "2.0", "method": method, "params": params}
+        if not notification:
+            message["id"] = request_id
+        async with asyncio.timeout(25):
+            async with self._client.stream("POST", self.endpoint, json=message) as response:
+                response.raise_for_status()
+                if method == "initialize" and (session := response.headers.get("mcp-session-id")):
+                    if len(session) > 256 or any(not 33 <= ord(c) <= 126 for c in session):
+                        raise ValueError("Invalid MCP session")
+                    self._session = session
+                    self._client.headers["Mcp-Session-Id"] = session
+                if notification:
+                    return None
+                is_sse = response.headers.get("content-type", "").startswith("text/event-stream")
+                buffer = b""
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > 1024 * 1024:
+                        raise ValueError("MCP response exceeds size limit")
+                    buffer += chunk
+                    if is_sse:
+                        buffer = buffer.replace(b"\r\n", b"\n")
+                        while b"\n\n" in buffer:
+                            event, buffer = buffer.split(b"\n\n", 1)
+                            data = b"\n".join(line[5:].lstrip(b" ") for line in event.splitlines()
+                                              if line.startswith(b"data:"))
+                            if data:
+                                result = self._response(json.loads(data), request_id)
+                                if result is not None:
+                                    return result
+                if not is_sse:
+                    result = self._response(json.loads(buffer), request_id)
+                    if result is not None:
+                        return result
+                raise ValueError("Missing MCP response")
+
+    @staticmethod
+    def _response(message, request_id):
+        if not isinstance(message, dict) or "method" in message or message.get("id") != request_id:
+            return None
+        if "error" in message:
+            # Never echo untrusted error bodies or request credentials.
+            raise RuntimeError("MCP server rejected request")
+        result = message.get("result")
+        if not isinstance(result, dict):
+            raise ValueError("Invalid MCP result")
+        return result
+
+    async def initialize(self):
+        result = await self.request("initialize", {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "clientInfo": {"name": "miniagent", "version": "1.0.0"}})
+        version = result.get("protocolVersion")
+        if version not in {"2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"}:
+            raise ValueError("Unsupported MCP protocol version")
+        self._client.headers["MCP-Protocol-Version"] = version
+        await self.request("notifications/initialized", {}, notification=True)
+
+    async def list_tools(self):
+        result = await self.request("tools/list", {})
+        tools = result.get("tools")
+        if not isinstance(tools, list):
+            raise ValueError("Invalid MCP tools list")
+        return tools
+
+    async def call_tool(self, name, args):
+        result = await self.request("tools/call", {"name": name, "arguments": args})
+        if result.get("isError"):
+            raise RuntimeError("MCP tool failed")
+        content = result.get("content")
+        if not isinstance(content, list):
+            raise ValueError("Invalid MCP tool content")
+        return "\n".join(block["text"] for block in content
+                         if isinstance(block, dict) and block.get("type") == "text"
+                         and isinstance(block.get("text"), str))
+
+    async def close(self):
+        try:
+            if self._session:
+                async with asyncio.timeout(3):
+                    async with self._client.stream("DELETE", self.endpoint):
+                        pass
+        except Exception:
+            pass
+        finally:
+            await self._client.aclose()

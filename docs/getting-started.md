@@ -1,5 +1,12 @@
 # Getting Started
 
+> **Sandbox CLI:** `python -m agents.main` now creates a fresh Docker workspace per task and
+> exports changes outside the original repository. Build with
+> `docker build -t miniagent-sandbox:1 sandbox`. See the [current quick start](../README.md#quick-start)
+> for supported flags, snapshot exclusions, limits and results. The Skills/MCP/Memory and persistent
+> REPL descriptions below document the retained library runtime, not the isolated CLI.
+
+
 This guide covers installation, configuration, running MiniAgent, permission modes, and the REPL commands.
 
 ## Requirements
