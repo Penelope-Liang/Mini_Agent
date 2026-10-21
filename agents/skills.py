@@ -65,7 +65,7 @@ def resolve_skill_prompt(skill: SkillDefinition, args: object) -> str:
     import re
     prompt = skill.prompt_template
     # Support $ARGUMENTS or ${ARGUMENTS} placeholders for user args in SKILL.md.
-    prompt = re.sub(r"\$ARGUMENTS|\$\{ARGUMENTS\}", str(args or ""), prompt)
+    prompt = re.sub(r"\$ARGUMENTS|\$\{ARGUMENTS\}", lambda _: str(args or ""), prompt)
     # Support ${CLAUDE_SKILL_DIR} to reference files in the skill directory.
     prompt = prompt.replace("${CLAUDE_SKILL_DIR}", skill.skill_dir)
     return prompt

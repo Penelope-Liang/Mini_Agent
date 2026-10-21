@@ -255,18 +255,22 @@ class PermissionTests(unittest.IsolatedAsyncioTestCase):
         approve = agent._plan_approval_fn
         # The bug this guards: a synchronous callback would leave the Agent holding a coroutine.
         self.assertTrue(inspect.iscoroutinefunction(approve))
-        with patch('builtins.input', side_effect=['1', '2', '3', '4', 'why', EOFError]):
-            choices = [(await approve('plan.md'))['choice'] for _ in range(5)]
-        self.assertEqual(choices, ['clear-and-execute', 'execute', 'manual-execute',
-                                   'keep-planning', 'keep-planning'])
-        # Only an explicit approval leaves read-only: EOF and rejection both keep plan mode.
-        with patch('builtins.input', side_effect=[EOFError, '4', 'revise', '2']):
-            self.assertIn('No approval received', await agent._execute_tool_call('exit_plan_mode', {}))
-            self.assertEqual(agent.permission_mode, 'plan')
+        with patch('builtins.input', side_effect=['1', '2', 'why', '3', EOFError]):
+            choices = [(await approve('Plan contents'))['choice'] for _ in range(4)]
+        self.assertEqual(choices, ['execute', 'keep-planning', 'exit', 'exit'])
+        with patch('builtins.input', side_effect=['2', 'revise', '1']):
             self.assertIn('revise', await agent._execute_tool_call('exit_plan_mode', {}))
             self.assertEqual(agent.permission_mode, 'plan')
             self.assertIn('approved', await agent._execute_tool_call('exit_plan_mode', {}))
         self.assertEqual(agent.permission_mode, 'default')
+
+    async def test_local_plan_approval_reads_file_contents(self):
+        agent = self.agent()
+        Path(agent._plan_file_path).write_text('Inspect and test the parser.')
+        agent._plan_approval_fn = AsyncMock(return_value={'choice': 'execute'})
+        result = await agent._execute_tool_call('exit_plan_mode', {})
+        agent._plan_approval_fn.assert_awaited_once_with('Inspect and test the parser.')
+        self.assertIn('Inspect and test the parser.', result)
 
     async def test_skill_fork_inherits_mode_and_intersects_tools(self):
         for mode in ('plan', 'dontAsk', 'default', 'acceptEdits'):
@@ -280,7 +284,7 @@ class PermissionTests(unittest.IsolatedAsyncioTestCase):
                 skill = {'context': 'fork', 'allowed_tools': allowed, 'prompt': 'offline test'}
                 with patch('agents.skills.execute_skill', return_value=skill), patch.object(Agent, 'run_once', run), \
                      patch.object(Agent, '_generate_plan_file_path', return_value=str(self.root / 'child-plan.md')):
-                    self.assertEqual(await parent._execute_tool_call('skill', {'skill_name': 'test'}), 'verified')
+                    self.assertEqual(json.loads(await parent._execute_tool_call('skill', {'skill_name': 'test'}))['text'], 'verified')
         self.assertEqual(self.file.read_text(), 'timeout=50\n')
 
     async def test_general_child_cannot_expand_parent_tools(self):
@@ -291,7 +295,7 @@ class PermissionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('Action denied:', await self.write(child))
             return {'text': 'verified', 'tokens': {'input': 0, 'cached': 0, 'output': 0}}
         with patch.object(Agent, 'run_once', run):
-            self.assertEqual(await parent._execute_tool_call('agent', {'prompt': 'test'}), 'verified')
+            self.assertEqual(json.loads(await parent._execute_tool_call('agent', {'prompt': 'test'}))['text'], 'verified')
 
     async def test_audit_records_allow_denial_and_execution_failure(self):
         agent = self.agent()
@@ -320,3 +324,76 @@ class PermissionTests(unittest.IsolatedAsyncioTestCase):
         await self.read(agent)
         self.assertIn('must read', await self.write(agent))
         self.assertEqual(self.file.read_bytes(), b'\x00binary')
+
+    async def test_stuck_progress_only_tracks_real_edits_and_survives_fold(self):
+        agent = self.agent('acceptEdits')
+        async def invoke(name, inp):
+            result = await agent._execute_tool_call(name, inp)
+            agent._observe_tool(name, inp, result)
+            return result
+        inp = {'file_path': str(self.file)}
+        await invoke('read_file', inp)
+        result = await invoke('write_file', {**inp, 'content': 'timeout=50\n'})
+        self.assertFalse(result.changed)
+        self.assertEqual(agent._progress['version'], 0)
+        await invoke('read_file', inp)
+        agent._record_fold_event()
+        await invoke('read_file', inp)
+        self.assertFalse(agent._aborted)
+        await invoke('read_file', inp)
+        self.assertTrue(agent._aborted)
+        other = self.agent('acceptEdits')
+        await other._execute_tool_call('read_file', inp)
+        for _ in range(3):
+            other._observe_tool('run_shell', {'command': 'pytest'}, 'same')
+        changed = await other._execute_tool_call('write_file', {**inp, 'content': 'timeout=60\n'})
+        other._observe_tool('write_file', inp, changed)
+        self.assertTrue(changed.changed)
+        self.assertEqual(other._progress['version'], 1)
+        other._observe_tool('run_shell', {'command': 'pytest'}, 'same')
+        self.assertFalse(other._aborted)
+
+    async def test_child_stop_status_propagates_through_both_entries(self):
+        parent = self.agent('default', ['agent', 'skill', 'read_file'])
+        async def run(child, prompt):
+            self.assertEqual(child.stuck_warn_at, parent.stuck_warn_at)
+            self.assertEqual(child.stuck_stop_at, parent.stuck_stop_at)
+            return {'text': 'partial findings', 'status': 'stopped', 'stop_reason': 'repeated_denial',
+                    'tokens': {'input': 0, 'cached': 0, 'output': 0}}
+        skill = {'context': 'fork', 'allowed_tools': ['read_file'], 'prompt': 'test'}
+        with patch.object(Agent, 'run_once', run), patch('agents.skills.execute_skill', return_value=skill):
+            for name, inp in [('agent', {'prompt': 'test'}), ('skill', {'skill_name': 'test'})]:
+                raw = await parent._execute_tool_call(name, inp)
+                self.assertEqual(raw.status, 'stopped')
+                result = json.loads(raw)
+                self.assertEqual(result['status'], 'stopped')
+                self.assertEqual(result['stop_reason'], 'repeated_denial')
+                self.assertFalse(parent._aborted)
+
+    async def test_parent_stops_after_repeated_child_stops_with_varied_prompts(self):
+        skill = {'context': 'fork', 'allowed_tools': ['read_file'], 'prompt': 'test'}
+        async def run(child, prompt):
+            return {'text': prompt, 'status': 'stopped', 'stop_reason': 'repeated_result',
+                    'tokens': {'input': 0, 'cached': 0, 'output': 0}}
+        with patch.object(Agent, 'run_once', run), patch('agents.skills.execute_skill', return_value=skill):
+            for name, key in [('agent', 'prompt'), ('skill', 'args')]:
+                parent = self.agent('default', ['agent', 'skill', 'read_file'])
+                for i in range(4):
+                    inp = {key: 'variant ' + str(i), 'skill_name': 'test'}
+                    text = parent._observe_tool(name, inp, await parent._execute_tool_call(name, inp))
+                    if i == 2:
+                        self.assertIn('Change approach', text)
+                self.assertTrue(parent._aborted)
+                self.assertIn('repeated_child_stop', parent._stop_reason)
+
+    async def test_denial_is_structured_and_survives_other_calls(self):
+        agent = self.agent('dontAsk')
+        for i in range(4):
+            denied = await self.write(agent)
+            self.assertEqual(denied.status, 'denied')
+            text = agent._observe_tool('write_file', {'file_path': str(self.file), 'content': 'changed'}, denied)
+            if i == 2:
+                self.assertIn('Change approach', text)
+            if not agent._aborted:
+                agent._observe_tool('read_file', {'file_path': str(i)}, 'data')
+        self.assertTrue(agent._aborted)

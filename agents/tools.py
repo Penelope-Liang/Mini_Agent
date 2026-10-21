@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+from .stuck_detector import ToolResult, StuckDetector, legacy_result
 
 import fnmatch
 import hashlib
@@ -183,15 +184,13 @@ tool_definitions: list[ToolDef] = [
     },
     {
         "name": "enter_plan_mode",
-        "description": "Enter plan mode to switch to a read-only planning phase. In plan mode, you can only read files and write to the plan file.",
+        "description": "Enter a read-only planning phase before requesting human approval.",
         "input_schema": {"type": "object", "properties": {}},
-        "deferred": True,
     },
     {
         "name": "exit_plan_mode",
-        "description": "Exit plan mode after you have finished writing your plan to the plan file.",
-        "input_schema": {"type": "object", "properties": {}},
-        "deferred": True,
+        "description": "Submit your complete plan for human approval. Only approval permits implementation.",
+        "input_schema": {"type": "object", "properties": {"plan": {"type": "string", "description": "Complete proposed plan", "maxLength": 65536}}, "required": ["plan"]},
     },
     {
         "name": "agent",
@@ -553,11 +552,15 @@ def _truncate_result(result:str) -> str:
     if len(result) <= MAX_RESULT_CHARS:
         return result
     keep_each = (MAX_RESULT_CHARS - 60) // 2
-    return (
+    shortened = (
         result[:keep_each]
         +f"\n\n[... truncated {len(result) - keep_each * 2} chars ...]\n\n"
         +result[-keep_each:]
     )
+    original = legacy_result(result)
+    shortened = ToolResult(shortened, original.status, changed=original.changed, approved=original.approved)
+    shortened.fingerprint = StuckDetector.result_key("", str(result))
+    return shortened
 
 
 
@@ -592,10 +595,10 @@ def _run_shell(inp: dict) -> str:
         if result.returncode != 0:
             stderr = f"\nStderr: {result.stderr}" if result.stderr else ""
             stdout = f"\nStdout: {result.stdout}" if result.stdout else ""
-            return f"Command failed (exit code {result.returncode}){stdout}{stderr}"
-        return output or "(no output)"
+            return ToolResult(f"Command failed (exit code {result.returncode}){stdout}{stderr}", "error")
+        return ToolResult(output or "(no output)")
     except subprocess.TimeoutExpired:
-        return f"Command timed out after {inp.get('timeout', 30000)}ms"
+        return ToolResult(f"Command timed out after {inp.get('timeout', 30000)}ms", "error")
     except Exception as e:
         return f"Error: {e}"
 
@@ -852,5 +855,4 @@ async def execute_tool(
 def reset_permission_cache() -> None:
     global _cached_rules
     _cached_rules = None
-
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+from .stuck_detector import StuckDetector, ToolResult, legacy_result
 
 import asyncio
 import json
@@ -166,15 +167,35 @@ class Agent:
                  custom_system_prompt: str | None=None,
                  custom_tools: list[ToolDef] | None=None,
                  is_sub_agent: bool=False,
-                 audit_path: str | None=None,):
+                 audit_path: str | None=None,
+                 workspace=None,
+                 stuck_warn_at: int = 3, stuck_stop_at: int = 4,):
+        self.stuck_warn_at, self.stuck_stop_at = stuck_warn_at, stuck_stop_at
+        self._stuck = StuckDetector(stuck_warn_at, stuck_stop_at)
+        self._stop_reason = None
+        self._progress = {"version": 0}
+        self.workspace = workspace
         self.permission_mode = permission_mode
         self.thinking = thinking
         self.model = model
         self.use_openai = bool(api_base)
         self.is_sub_agent = is_sub_agent
         self.tools = list(tool_definitions if custom_tools is None else custom_tools)
+        if workspace is not None:
+            from .workspace import SANDBOX_TOOLS
+            from .context7 import TOOL_NAMES as CONTEXT7_TOOLS
+            permitted = SANDBOX_TOOLS | (CONTEXT7_TOOLS if getattr(workspace, "context7", None) else set())
+            self.tools = [t for t in self.tools if t['name'] in permitted and (not is_sub_agent or t['name'] not in {'enter_plan_mode', 'exit_plan_mode'})]
+            custom_system_prompt = (custom_system_prompt or 'You are a coding assistant.') + (
+                '\nAll file and shell tools run in an isolated /workspace copy. Use relative paths. '
+                'The original repository is not writable. Inspect project instructions with read_file. '
+                'Use tools to investigate, edit, and test. Report actual validation and uncertainties. '
+                'The container has no network; dependencies must already be in its image. '
+                'Changes are exported for review, not applied to the original repository.')
         self._custom_tool_names = None if custom_tools is None else {t["name"] for t in custom_tools}
-        self.audit_path = Path(audit_path) if audit_path else Path.cwd() / ".miniagent" / "permission-audit.jsonl"
+        self.audit_path = Path(audit_path) if audit_path else (
+            workspace.output / "audit.jsonl" if workspace is not None
+            else Path.cwd() / ".miniagent" / "permission-audit.jsonl")
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
         self.confirm_fn = confirm_fn
@@ -200,6 +221,7 @@ class Agent:
         # Plan Mode state variables
         self._pre_plan_mode: str | None=None
         self._plan_file_path: str | None=None
+        self.plan_content = None
         self._plan_approval_fn : Callable[[str], Awaitable[dict]] | None=None
         self._context_cleared : bool=False
 
@@ -233,9 +255,6 @@ class Agent:
         self._folded_session_memories: list[dict[str, Any]] = []
         self._fold_last_time: float = 0.0
         self._fold_count: int = 0
-        self._tool_error_streak: int = 0
-        self._same_tool_repeat_count: int = 0
-        self._last_tool_name: str = ""
         # tool name -> [calls, successes], cumulative for the session
         self._tool_stats: dict[str, list[int]] = {}
 
@@ -271,7 +290,7 @@ class Agent:
         if not self._model_supports_thinking():
             return "disabled"
 
-        if self._mode_supports_adaptive_thinking(self.model):
+        if self._model_supports_adaptive_thinking():
             return "adaptive"
         return "enabled"
 
@@ -287,11 +306,15 @@ class Agent:
         return "opus-4-6" in m or "sonnet-4-6" in m
 
     # Generate absolute path for the AI plan Markdown file.
-    def _generate_plan_file_path(self) -> str:
+    def _generate_plan_file_path(self) -> str | None:
+        if self.workspace is not None:
+            return None
         d = Path.home() / ".miniagent" / "plans"
         return str(d / f"plan-{self.session_id}.md")
 
     def _build_plan_mode_prompt(self) -> str:
+        if self.workspace is not None:
+            return "\nPlan mode: use read-only tools. Do not edit files. Submit the complete plan via exit_plan_mode(plan=...) for human approval." if not self.is_sub_agent else "\nPlan mode: use read-only tools and return your findings as text. Do not request plan approval."
         return f"""
 
     # Plan Mode Active
@@ -423,7 +446,7 @@ class Agent:
 
     async def  chat(self, user_message:str, *, skill_query: str | None = None)->None:
         # Lazily load MCP services on first chat
-        if not self._mcp_initialized and not self.is_sub_agent:
+        if not self._mcp_initialized and not self.is_sub_agent and self.workspace is None:
             self._mcp_initialized = True
             try:
                 await self._mcp_manager.load_and_connect()
@@ -438,13 +461,15 @@ class Agent:
         ready_skill_extraction_window: dict[str, Any] | None = None
         self._last_retrieved_skill_reference = None
         self._last_retrieved_skill_hits = []
-        if not self.is_sub_agent:
+        if not self.is_sub_agent and self.workspace is None:
             ready_skill_extraction_window = self._pop_pending_skill_extraction_window(original_user_message)
             user_message, self._last_retrieved_skill_reference = self._augment_user_message_with_skill_context(
                 original_user_message, query=skill_query
             )
 
         self._aborted = False
+        self._stop_reason = None
+        self._stuck = StuckDetector(self.stuck_warn_at, self.stuck_stop_at)
         self._turn_output_buffer = []
         coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
         self._current_task = asyncio.create_task(coro)
@@ -452,12 +477,16 @@ class Agent:
             await self._current_task
         except asyncio.CancelledError:
             self._aborted = True
+            # Propagate cancellation of the caller (including task deadlines).
+            # An explicit abort of the child loop still returns a stopped result.
+            if asyncio.current_task().cancelling():
+                raise
 
         finally:
             self._current_task = None
         assistant_text = "".join(self._turn_output_buffer or []).strip()
         self._turn_output_buffer = None
-        if not self.is_sub_agent and not self._aborted:
+        if not self.is_sub_agent and not self._aborted and self.workspace is None:
             self._schedule_background_skill_task(self._run_skill_usage_tracking(original_user_message, assistant_text))
             if ready_skill_extraction_window:
                 self._schedule_background_skill_task(self._run_online_skill_evolution(ready_skill_extraction_window))
@@ -473,7 +502,7 @@ class Agent:
 
 
    # Run one conversation turn, collect output text, and return token usage
-    async def run_once(self, prompt:str)->None:
+    async def run_once(self, prompt:str)->dict:
         self._output_buffer = []
         prev_in = self.total_input_tokens
         prev_cached = self.total_cached_input_tokens
@@ -483,6 +512,8 @@ class Agent:
         self._output_buffer = None
         return {
             "text": text,
+            "status": "stopped" if self._aborted or self._check_budget()["exceeded"] else "completed",
+            "stop_reason": self._stop_reason or (self._check_budget().get("reason")) or ("Task interrupted" if self._aborted else None),
             "tokens":{
                 "input":self.total_input_tokens-prev_in,
                 "cached":self.total_cached_input_tokens-prev_cached,
@@ -509,10 +540,8 @@ class Agent:
         return (
             "\n\n# Runtime Fold Guidance\n"
             f"- Current context utilization: {utilization:.0%}\n"
-            f"- Recent tool error streak: {self._tool_error_streak}\n"
-            f"- Same tool repeat count: {self._same_tool_repeat_count}\n"
             f"- Last fold: {last_fold}\n"
-            "- If the context is getting long, the same tool is being retried without progress, or tool failures are accumulating, call `compact_context` before trying more tools.\n"
+            "- If the context is getting long, call `compact_context` before trying more tools.\n"
             "- If you folded very recently and the next step is clear, prefer continuing rather than folding again.\n"
         )
 
@@ -532,15 +561,28 @@ class Agent:
         stat = self._tool_stats.setdefault(tool_name, [0, 0])
         stat[0] += 1
         stat[1] += int(success)
-        if tool_name == self._last_tool_name:
-            self._same_tool_repeat_count += 1
+
+    def _observe_tool(self, name, inp, raw):
+        result = legacy_result(raw)
+        self._record_tool_outcome(name, result.status == "success")
+        if result.changed:
+            self._progress["version"] += 1
+        if self._stop_reason:
+            return str(result)
+        event = self._stuck.observe(name, inp, result, self._progress["version"])
+        if not event:
+            return str(result)
+        self._audit_permission({"phase": "stuck_detection", "session_id": self.session_id,
+                                "tool": name, **event})
+        reason = f"{event['pattern']} for {name} ({event['count']} observations)"
+        if event["action"] == "stop":
+            self._stop_reason = reason
+            self._aborted = True
+            message = "Task stopped: " + reason
+            self._emit_text("\n" + message + "\n")
         else:
-            self._same_tool_repeat_count = 1
-        self._last_tool_name = tool_name
-        if success:
-            self._tool_error_streak = 0
-        else:
-            self._tool_error_streak += 1
+            message = "Repeated behavior detected: " + reason + ". Change approach; continued repetition will stop this task."
+        return str(result) + "\n\n" + message
 
     def tool_stats(self) -> dict:
         """Cumulative tool call counts and success rates for this session."""
@@ -560,17 +602,6 @@ class Agent:
     def _record_fold_event(self) -> None:
         self._fold_last_time = time.time()
         self._fold_count += 1
-        self._tool_error_streak = 0
-        self._same_tool_repeat_count = 0
-        self._last_tool_name = ""
-
-    def _looks_like_tool_failure(self, tool_name: str, raw: str, result: str) -> bool:
-        text = f"{raw}\n{result}".lower()
-        if any(marker in text for marker in ("error", "denied", "timed out", "timeout")):
-            return True
-        if tool_name == "compact_context" and "no context compaction" in text:
-            return True
-        return False
 
     def _augment_user_message_with_skill_context(self, user_message: str, *, query: str | None = None) -> tuple[str, dict[str, Any] | None]:
         try:
@@ -769,9 +800,6 @@ class Agent:
         self._last_retrieved_skill_hits = []
         self._fold_last_time = 0.0
         self._fold_count = 0
-        self._tool_error_streak = 0
-        self._same_tool_repeat_count = 0
-        self._last_tool_name = ""
         self._tool_stats = {}
         if self.use_openai:
             self._openai_messages.append({"role": "system", "content":self._system_prompt})
@@ -910,6 +938,8 @@ class Agent:
         return len(self._openai_messages) if self.use_openai else len(self._anthropic_messages)
 
     def _auto_save(self) -> None:
+        if self.workspace is not None:
+            return
         try:
             save_session(self.session_id, {
                 "metadata": {
@@ -993,7 +1023,8 @@ class Agent:
         }
         self._folded_session_memories.append(record)
         try:
-            save_folded_session_memory(self.session_id, _sanitize_for_utf8(record))
+            if self.workspace is None:
+                save_folded_session_memory(self.session_id, _sanitize_for_utf8(record))
         except Exception:
             pass
 
@@ -1150,6 +1181,8 @@ class Agent:
     # Leave only a file path and preview in the conversation; the model can read_file later for the full output
 
     def _persist_large_result(self, tool_name: str, result: str) -> str:
+        if getattr(self, "workspace", None) is not None:
+            return result
         THRESHOLD = 30 * 1024  # 30 KB
         # Convert to bytes
         if (len (result.encode())) <= THRESHOLD:
@@ -1181,7 +1214,31 @@ class Agent:
         with self.audit_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(event, ensure_ascii=False) + "\n")
 
-    async def _execute_tool_call(self, name: str, inp: dict) -> str:
+    async def _execute_tool_call(self, name: str, inp: dict) -> ToolResult:
+        if self._stop_reason:
+            return ToolResult("Task stopped: " + self._stop_reason, "error")
+        path = Path(inp["file_path"]) if self.workspace is None and name in {"write_file", "edit_file"} and "file_path" in inp else None
+        before = current_content_hash(path) if path else None
+        result = legacy_result(await self._execute_tool_impl(name, inp))
+        if path and result.status == "success":
+            result.changed = before != current_content_hash(path)
+        return result
+
+    async def _request_approval(self, event: dict, prompt: str, title: str) -> bool:
+        try:
+            return await self._confirm_dangerous(prompt, title)
+        except asyncio.CancelledError:
+            # An audit failure must not replace the cancellation that stops the task.
+            try:
+                self._audit_permission({**event, "phase": "authorization", "approved": False,
+                                        "outcome": "cancelled-while-waiting"})
+            except OSError:
+                pass
+            raise
+
+    async def _execute_tool_impl(self, name: str, inp: dict) -> str:
+        if self.workspace is not None:
+            return await self._execute_sandbox_tool(name, inp)
         event = {"call_id": uuid.uuid4().hex, "session_id": self.session_id,
                  "time": time.time(), "mode": self.permission_mode, "tool": name}
         try:
@@ -1197,28 +1254,84 @@ class Agent:
                 proposal = build_write_proposal(name, inp)
                 if proposal:
                     event["proposal"] = {k: proposal[k] for k in ("path", "before_hash", "after_hash")}
-                allowed = await self._confirm_dangerous(
-                    proposal["prompt"] if proposal else permission["message"],
+                allowed = await self._request_approval(
+                    event, proposal["prompt"] if proposal else permission["message"],
                     "Approve this change" if proposal else "Dangerous command")
                 event["approved"] = allowed
             # Persist authorization before executing; audit failure prevents execution.
             self._audit_permission({**event, "phase": "authorization"})
             if not allowed:
-                return f"Action denied: {permission.get('message', 'Approval refused')}"
+                return ToolResult(f"Action denied: {permission.get('message', 'Approval refused')}", "denied")
             stale = stale_proposal_reason(proposal) if proposal else None
             if stale:
                 self._audit_permission({**event, "phase": "completion", "outcome": "stale-approval"})
-                return f"Action denied: {stale}"
+                return ToolResult(f"Action denied: {stale}", "denied")
             result = await self._dispatch_tool_call(name, inp)
-            failed = result.startswith(("Error", "Warning:", "Action denied:", "Unknown"))
+            result = legacy_result(result)
+            failed = result.status != "success"
             completion = {**event, "phase": "completion", "outcome": "failed" if failed else "completed"}
             if proposal and not failed:
                 completion["wrote_approved_content"] = (
                     current_content_hash(Path(proposal["path"])) == proposal["after_hash"])
             self._audit_permission(completion)
+            result.approved = event.get("approved", False)
             return result
         except Exception as exc:
-            return f"Error executing tool: {exc}"
+            return ToolResult(f"Error executing tool: {exc}", "error")
+
+    async def _execute_sandbox_tool(self, name: str, inp: dict) -> str:
+        from .workspace import FILE_TOOLS, SANDBOX_TOOLS
+
+        event = {"call_id": uuid.uuid4().hex, "session_id": self.session_id,
+                 "time": time.time(), "mode": self.permission_mode, "tool": name}
+        try:
+            if not self.workspace.active:
+                raise RuntimeError("Sandbox unavailable; task must stop")
+            from .context7 import TOOL_NAMES as CONTEXT7_TOOLS
+            context7 = getattr(self.workspace, 'context7', None)
+            external = context7 is not None and name in CONTEXT7_TOOLS
+            permitted = SANDBOX_TOOLS | (CONTEXT7_TOOLS if context7 else set())
+            if external:
+                event['arguments'] = context7.audit_arguments(name, inp)
+                reason = context7.validate(name, inp)
+                if reason:
+                    self._audit_permission({**event, 'phase': 'authorization', 'decision': 'deny', 'reason': reason})
+                    return ToolResult('Action denied: ' + reason, 'denied')
+            inp = self.workspace.normalize(inp)
+            if name not in permitted or name not in {t['name'] for t in self.tools}:
+                permission = {"action": "deny", "message": "Tool outside sandbox allowlist"}
+            else:
+                permission = check_permission(name, inp, self.permission_mode)
+            event.update(decision=permission['action'], reason=permission.get('message', ''))
+            allowed = permission['action'] == 'allow'
+            proposal = None
+            if permission['action'] == 'confirm':
+                if name in {'write_file', 'edit_file'}:
+                    proposal = await self.workspace.prepare(name, inp)
+                    event['proposal'] = {k: proposal[k] for k in ('path', 'before_hash', 'after_hash')}
+                allowed = await self._request_approval(
+                    event, proposal['prompt'] if proposal else permission['message'], 'Approve sandbox action')
+                event['approved'] = allowed
+            self._audit_permission({**event, 'phase': 'authorization'})
+            if not allowed:
+                return ToolResult('Action denied: ' + permission.get('message', 'Approval refused'), 'denied')
+            if external:
+                result = await context7.call_tool(name, inp, self._audit_permission)
+            elif name in FILE_TOOLS:
+                result = await self.workspace.execute(name, inp, self._read_file_state, proposal)
+            else:
+                result = await self._dispatch_tool_call(name, inp)
+            result = legacy_result(result)
+            result.approved = event.get('approved', False)
+            failed = result.status != 'success'
+            self._audit_permission({**event, 'phase': 'completion', 'outcome': 'failed' if failed else 'completed'})
+            return result
+        except Exception as exc:
+            if not self.workspace.active:
+                self._aborted = True
+                self._stop_reason = self._stop_reason or "Sandbox unavailable"
+            self._audit_permission({**event, 'phase': 'completion', 'outcome': 'failed', 'error': str(exc)})
+            return ToolResult(f'Error executing sandbox tool: {exc}', 'error')
 
     async def _dispatch_tool_call(self, name: str, inp: dict) -> str:
         # Never raises: tool failures come back as text so the model can react to them.
@@ -1226,7 +1339,7 @@ class Agent:
             if name == "compact_context":
                 return await self._execute_compact_context_tool(inp)
             if name in ("enter_plan_mode", "exit_plan_mode"):
-                return await self._execute_plan_mode_tool(name)
+                return await self._execute_plan_mode_tool(name, inp)
             if name == "agent":
                 return await self._execute_agent_tool(inp)
             if name == "skill":
@@ -1250,9 +1363,7 @@ class Agent:
         reason = str(inp.get("reason") or "").strip()
         compacted = await self._compact_conversation(trigger="tool")
         if not compacted:
-            self._record_tool_outcome("compact_context", False)
-            return "No context compaction was performed because there is not enough conversation history yet."
-        self._record_tool_outcome("compact_context", True)
+            return ToolResult("No context compaction was performed because there is not enough conversation history yet.", "error")
         self._context_cleared = True
         suffix = f"\nReason: {reason}" if reason else ""
         return (
@@ -1279,94 +1390,80 @@ class Agent:
             sub_agent = Agent(
                 model=self.model,
                 api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
+                anthropic_base_url=str(self._anthropic_client.base_url) if self._anthropic_client else None,
+                api_key=getattr(self._openai_client or self._anthropic_client, "api_key", None),
                 custom_system_prompt=result["prompt"],
                 custom_tools=tools,
                 is_sub_agent=True,
                 permission_mode=self.permission_mode,
-                confirm_fn=self.confirm_fn,
+                confirm_fn=None if self.workspace is not None else self.confirm_fn,
                 audit_path=str(self.audit_path),
+                workspace=self.workspace,
+                stuck_warn_at=self.stuck_warn_at, stuck_stop_at=self.stuck_stop_at,
             )
             try:
+                sub_agent._progress = self._progress
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
                 self.total_input_tokens += sub_result["tokens"]["input"]
                 self.total_cached_input_tokens += sub_result["tokens"]["cached"]
                 self.total_output_tokens += sub_result["tokens"]["output"]
-                print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
-                return sub_result["text"] or "(Skill produced no output)"
+                print_sub_agent_end("skill-fork", inp.get("skill_name", ""), sub_result.get("status", "completed"))
+                text = json.dumps({"status": sub_result.get("status", "completed"), "stop_reason": sub_result.get("stop_reason"), "text": sub_result["text"]})
+                return ToolResult(text, "stopped") if sub_result.get("status") == "stopped" else text
             except Exception as e:
-                print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
-                return f"Skill fork error: {e}"
+                print_sub_agent_end("skill-fork", inp.get("skill_name", ""), "failed")
+                return ToolResult(f"Skill fork error: {e}", "error")
+            finally:
+                if client := sub_agent._openai_client or sub_agent._anthropic_client:
+                    await client.close()
 
         return f'[Skill "{inp.get("skill_name", "")}" activated]\n\n{result["prompt"]}'
 
-    async def _execute_plan_mode_tool(self, name):
+    async def _execute_plan_mode_tool(self, name, inp=None):
+        if self.is_sub_agent:
+            return ToolResult("Action denied: plan approval is available only to the main agent.", "denied")
         if name == "enter_plan_mode":
             if self.permission_mode == "plan":
                 return "Already in plan mode."
             self._pre_plan_mode = self.permission_mode
             self.permission_mode = "plan"
-            self._plan_file_path =  self._generate_plan_file_path()
-            self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
-            if self.use_openai and self._openai_messages:
-                self._openai_messages[0]["content"] = self._system_prompt
-            print_info("Entered plan mode (read-only). Plan file: " + self._plan_file_path)
-            return f"Entered plan mode. You are now in read-only mode.\n\nYour plan file: {self._plan_file_path}\nWrite your plan to this file. This is the only file you can edit.\n\nWhen your plan is complete, call exit_plan_mode."
-        if name == "exit_plan_mode":
-            if self.permission_mode != "plan":
-                return "Not in plan mode."
-            plan_content = "(No plan file found)"
-            if self._plan_file_path and Path(self._plan_file_path).exists():
-                plan_content = self._plan_file_path
-            # Interactive approval flow when an approval function is set
-            if self._plan_approval_fn:
-                result = await self._plan_approval_fn(plan_content)
-                choice = result.get("choice", "keep-planning")
-                if choice not in {"keep-planning", "clear-and-execute", "execute", "manual-execute"}:
-                    return "Action denied: invalid plan approval."
-
-                if choice =="keep-planning":
-                    feedback = result.get("feedback") or "Please revise the plan."
-                    return (
-                        f"User rejected the plan and wants to keep planning.\n\n"
-                        f"User feedback: {feedback}\n\n"
-                        f"Please revise your plan based on this feedback. When done, call exit_plan_mode again."
-                    )
-
-                if choice in {"clear-and-execute", "execute"}:
-                    # Approving a plan is not approving its edits: each one is
-                    # still confirmed against the file it was proposed against.
-                    target_mode = "default"
-                else:  # manual-execute
-                    target_mode = self._pre_plan_mode or "default"
-
-                # Exit plan mode
-                self.permission_mode = target_mode
-                self._pre_plan_mode = None
-                saved_plan_path = self._plan_file_path
-                self._plan_file_path = None
-                self._system_prompt = self._base_system_prompt
-                if self.use_openai and self._openai_messages:
-                    self._openai_messages[0]["content"] = self._system_prompt
-
-                if choice == "clear-and-execute":
-                    self._clear_history_keep_system()
-                    self._context_cleared = True
-                    print_info(f"Plan approved. Context cleared, executing in {target_mode} mode.")
-                    return (
-                        f"User approved the plan. Context was cleared. Permission mode: {target_mode}\n\n"
-                        f"Plan file: {saved_plan_path}\n\n"
-                        f"## Approved Plan:\n{plan_content}\n\n"
-                        f"Proceed with implementation."
-                    )
-                print_info(f"Plan approved. Executing in {target_mode} mode.")
-                return (
-                    f"User approved the plan. Permission mode: {target_mode}\n\n"
-                    f"## Approved Plan:\n{plan_content}\n\n"
-                    f"Proceed with implementation."
-                )
-            return "Action denied: exiting plan mode requires explicit user approval."
-
-        return f"Unknown plan mode tool: {name}"
+            self._plan_file_path = self._generate_plan_file_path()
+            self._refresh_runtime_system_prompt()
+            return "Entered plan mode. Use read-only tools and submit the complete plan via exit_plan_mode."
+        if name != "exit_plan_mode":
+            return f"Unknown plan mode tool: {name}"
+        if self.permission_mode != "plan":
+            return "Not in plan mode."
+        plan = (inp or {}).get("plan")
+        if self.workspace is not None:
+            if not isinstance(plan, str) or not plan.strip() or len(plan.encode('utf-8')) > 65536:
+                return ToolResult("Error: plan must be non-empty text of at most 65536 UTF-8 bytes.", "error")
+            self.plan_content = plan
+            (self.workspace.output / "plan.md").write_text(plan, encoding="utf-8")
+        else:
+            if plan is None:
+                plan = Path(self._plan_file_path).read_text(encoding="utf-8") if self._plan_file_path and Path(self._plan_file_path).exists() else "(No plan file found)"
+            self.plan_content = plan
+        if self._pre_plan_mode == "dontAsk":
+            decision = {"choice": "exit"}
+        elif self._plan_approval_fn is None:
+            return ToolResult("Action denied: exiting plan mode requires explicit user approval.", "denied")
+        else:
+            decision = await self._plan_approval_fn(plan)
+        choice = decision.get("choice")
+        if choice == "keep-planning":
+            return f"User wants to keep planning. Feedback: {decision.get('feedback') or 'Please revise the plan.'}\nSubmit the revised plan via exit_plan_mode."
+        if choice == "exit":
+            self._stop_reason = "Plan not approved; exited without executing"
+            self._aborted = True
+            return ToolResult(self._stop_reason, "stopped")
+        if choice != "execute":
+            return ToolResult("Action denied: invalid plan approval.", "denied")
+        self.permission_mode = "default"
+        self._pre_plan_mode = None
+        self._plan_file_path = None
+        self._refresh_runtime_system_prompt()
+        return f"User approved the plan. Proceed in default mode; tool permissions still apply.\n\n## Approved Plan:\n{plan}"
 
     def _clear_history_keep_system(self) -> None:
         """Clear history while keeping the system prompt."""
@@ -1377,9 +1474,6 @@ class Agent:
         self.last_input_token_count = 0
         self._fold_last_time = 0.0
         self._fold_count = 0
-        self._tool_error_streak = 0
-        self._same_tool_repeat_count = 0
-        self._last_tool_name = ""
 
     async def _execute_agent_tool(self, inp:dict) -> str:
         agent_type = inp.get("type", "general")
@@ -1392,23 +1486,32 @@ class Agent:
         sub_agent = Agent(
             model=self.model,
             api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
+            anthropic_base_url=str(self._anthropic_client.base_url) if self._anthropic_client else None,
+            api_key=getattr(self._openai_client or self._anthropic_client, "api_key", None),
             custom_system_prompt=config["system_prompt"],
             custom_tools=[t for t in config["tools"] if t["name"] in {p["name"] for p in self.tools}],
             is_sub_agent=True,
             permission_mode=self.permission_mode,
-            confirm_fn=self.confirm_fn,
+            confirm_fn=None if self.workspace is not None else self.confirm_fn,
             audit_path=str(self.audit_path),
+            workspace=self.workspace,
+            stuck_warn_at=self.stuck_warn_at, stuck_stop_at=self.stuck_stop_at,
         )
         try:
+            sub_agent._progress = self._progress
             result = await sub_agent.run_once(prompt)
             self.total_input_tokens += result["tokens"]["input"]
             self.total_cached_input_tokens += result["tokens"]["cached"]
             self.total_output_tokens += result["tokens"]["output"]
-            print_sub_agent_end(agent_type, description)
-            return result["text"] or "(Sub-agent produced no output)"
+            print_sub_agent_end(agent_type, description, result.get("status", "completed"))
+            text = json.dumps({"status": result.get("status", "completed"), "stop_reason": result.get("stop_reason"), "text": result["text"]})
+            return ToolResult(text, "stopped") if result.get("status") == "stopped" else text
         except Exception as e:
-            print_sub_agent_end(agent_type, description)
-            return f"Sub-agent error: {e}"
+            print_sub_agent_end(agent_type, description, "failed")
+            return ToolResult(f"Sub-agent error: {e}", "error")
+        finally:
+            if client := sub_agent._openai_client or sub_agent._anthropic_client:
+                await client.close()
 
 # -------------- Anthropic backend ---------------
     async def  _chat_anthropic(self, user_message: str) -> None:
@@ -1420,7 +1523,7 @@ class Agent:
         # Async memory prefetch: only the main agent injects memories, not sub-agents.
         # Start a background task without blocking the current model call.
         memory_prefetch:MemoryPrefetch | None = None
-        if not self.is_sub_agent:
+        if not self.is_sub_agent and self.workspace is None:
             sq = self._build_side_query()
             if sq:
                 memory_prefetch = start_memory_prefetch(
@@ -1484,7 +1587,16 @@ class Agent:
 
 
             # Call Anthropic streaming API; completed tool blocks trigger _on_tool_block.
-            response = await self._dispatch_model_request(self._call_anthropic_stream, on_tool_block_complete=_on_tool_block)
+            try:
+                response = await self._dispatch_model_request(self._call_anthropic_stream, on_tool_block_complete=_on_tool_block)
+                # Drain speculative calls even if budget/stop handling skips their collection below.
+                if early_executions:
+                    await asyncio.gather(*early_executions.values())
+            except BaseException:
+                for task in early_executions.values():
+                    task.cancel()
+                await asyncio.gather(*early_executions.values(), return_exceptions=True)
+                raise
             if not self.is_sub_agent:
                 stop_spinner()
 
@@ -1551,18 +1663,18 @@ class Agent:
                 early_task = early_executions.get(tu.id)
                 if early_task:
                     raw = await early_task
+                    raw = self._observe_tool(tu.name, inp, raw)
                     raw = _safe_utf8_text(raw)
                     res = self._persist_large_result(tu.name, raw)
                     print_tool_result(tu.name, res)
-                    self._record_tool_outcome(tu.name, not self._looks_like_tool_failure(tu.name, raw, res))
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
                     continue
 
                 raw = await self._execute_tool_call(tu.name, inp)
+                raw = self._observe_tool(tu.name, inp, raw)
                 raw = _safe_utf8_text(raw)
                 res = self._persist_large_result(tu.name, raw)
                 print_tool_result(tu.name, res)
-                self._record_tool_outcome(tu.name, not self._looks_like_tool_failure(tu.name, raw, res))
 
                 if self._context_cleared:
                     # If context was cleared during execution, write the result as a new user message,
@@ -1575,12 +1687,22 @@ class Agent:
                 # Anthropic requires tool_result entries to reference prior tool_use ids.
                 tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
 
+            if self._aborted:
+                completed = {item["tool_use_id"] for item in tool_results}
+                for tu in tool_uses:
+                    if tu.id not in completed:
+                        pending = early_executions.get(tu.id)
+                        text = str(await pending) if pending else "Tool skipped: task stopped"
+                        tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": text})
+
             if not context_break and tool_results:
                 # Anthropic requires a user/tool_result message immediately after assistant/tool_use,
                 # containing results for all tool_use blocks in that turn.
                 self._anthropic_messages.append({"role": "user", "content": tool_results})
 
             self._context_cleared = False
+            if self._aborted:
+                break
 
             # Tool results can be long; check whether context compaction is needed after each turn.
             self._refresh_runtime_system_prompt()
@@ -1609,8 +1731,10 @@ class Agent:
                 "messages": _sanitize_for_utf8(self._anthropic_messages),
             }
             # When thinking mode is enabled, add the thinking parameter to the Anthropic request.
-            if self._thinking_mode  in ("adaptive", "enabled"):
-                create_params["thinking"]={"type": "enabled", "budget_tokens": max_output - 1}
+            if self._thinking_mode == "adaptive":
+                create_params["thinking"] = {"type": "adaptive"}
+            elif self._thinking_mode == "enabled":
+                create_params["thinking"] = {"type": "enabled", "budget_tokens": max_output - 1}
 
             first_text = True
 
@@ -1688,7 +1812,7 @@ class Agent:
 
         # MemoryPrefetch handle
         memory_prefetch: MemoryPrefetch | None = None
-        if not self.is_sub_agent:
+        if not self.is_sub_agent and self.workspace is None:
             sq = self._build_side_query()
             if sq:
                 memory_prefetch = start_memory_prefetch(
@@ -1777,9 +1901,8 @@ class Agent:
                 # Hand malformed arguments back to the model rather than running the tool with {}.
                 if bad_args:
                     print_info(f"Invalid arguments for {fn_name}: {bad_args}")
-                    self._record_tool_outcome(fn_name, False)
                     oai_checked.append({"tc": tc, "fn": fn_name, "inp": {}, "allowed": False,
-                                        "result": f"Arguments for {fn_name} were {bad_args}. Resend the call with a JSON object."})
+                                        "result": ToolResult(f"Arguments for {fn_name} were {bad_args}. Resend the call with a JSON object.", "error")})
                     continue
 
                 print_tool_call(fn_name, inp)
@@ -1802,34 +1925,27 @@ class Agent:
                 if batch["concurrent"]:
                     async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
                         raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
-                        raw = _safe_utf8_text(raw)
-                        res = self._persist_large_result(ct_item["fn"], raw)
-                        print_tool_result(ct_item["fn"], res)
-                        return ct_item, res
+                        return ct_item, raw
 
                     results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
                     for ct_item, res in results:
-                        self._record_tool_outcome(
-                            ct_item["fn"],
-                            not self._looks_like_tool_failure(ct_item["fn"], "", res),
-                        )
+                        res = self._observe_tool(ct_item["fn"], ct_item["inp"], res)
+                        res = self._persist_large_result(ct_item["fn"], _safe_utf8_text(res))
+                        print_tool_result(ct_item["fn"], res)
                         self._openai_messages.append(
                             {"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
                 else:
                     for ct in batch["items"]:
                         if not ct["allowed"]:
                             self._openai_messages.append(
-                                {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
+                                {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": self._observe_tool(ct["fn"], ct["inp"], ct["result"])})
                             continue
 
                         raw = await self._execute_tool_call(ct["fn"], ct["inp"])
+                        raw = self._observe_tool(ct["fn"], ct["inp"], raw)
                         raw = _safe_utf8_text(raw)
                         res = self._persist_large_result(ct["fn"], raw)
                         print_tool_result(ct["fn"], res)
-                        self._record_tool_outcome(
-                            ct["fn"],
-                            not self._looks_like_tool_failure(ct["fn"], raw, res),
-                        )
 
                         if self._context_cleared:
                             self._context_cleared = False
@@ -1840,6 +1956,13 @@ class Agent:
                         self._openai_messages.append(
                             {"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
 
+            if self._aborted:
+                completed = {m.get("tool_call_id") for m in self._openai_messages if m.get("role") == "tool"}
+                for tc in tool_calls:
+                    if tc["id"] not in completed:
+                        self._openai_messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                                      "content": "Tool skipped: task stopped"})
+                break
             self._context_cleared = False
             self._refresh_runtime_system_prompt()
             await self._check_and_compact()
