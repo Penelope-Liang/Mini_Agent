@@ -4,7 +4,7 @@
 # machine. Everything below is deliberately limited to [tool.ruff].
 
 [tool.ruff]
-target-version = "py312"
+target-version = "py313"
 exclude = ["archive", "data", "temp_*.py"]
 
 [tool.ruff.lint]

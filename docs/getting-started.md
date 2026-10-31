@@ -2,7 +2,7 @@
 
 > **Sandbox CLI:** `python -m agents.main` now creates a fresh Docker workspace per task and
 > exports changes outside the original repository. Build with
-> `docker build -t miniagent-sandbox:1 sandbox`. See the [current quick start](../README.md#quick-start)
+> `docker build -t miniagent-sandbox:1 sandbox`. See the [sandbox guide](sandbox-cli.md)
 > for supported flags, snapshot exclusions, limits and results. The Skills/MCP/Memory and persistent
 > REPL descriptions below document the retained library runtime, not the isolated CLI.
 
@@ -11,7 +11,7 @@ This guide covers installation, configuration, running MiniAgent, permission mod
 
 ## Requirements
 
-- Python 3.11 or newer
+- Python 3.13
 - macOS or Linux
 - An OpenAI-compatible or Anthropic-compatible API endpoint
 - `ripgrep` (optional; search falls back to `grep`, then to a pure-Python scan)
@@ -19,10 +19,10 @@ This guide covers installation, configuration, running MiniAgent, permission mod
 ## Install
 
 ```bash
-git clone <your-repo-url>
-cd MiniAgent
+git clone https://github.com/Penelope-Liang/Mini_Agent.git
+cd Mini_Agent
 
-python3 -m venv .venv
+python3.13 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```

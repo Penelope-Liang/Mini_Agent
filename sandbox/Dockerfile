@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.13-slim
 COPY worker.py /opt/miniagent-worker.py
 ENV HOME=/tmp PYTHONDONTWRITEBYTECODE=1
 USER 10001:10001
