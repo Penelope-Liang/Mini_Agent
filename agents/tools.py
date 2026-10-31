@@ -386,7 +386,7 @@ def current_content_hash(path: Path) -> str | None:
 _SECRET_KEY_PARTS = ("password", "passwd", "secret", "token", "credential", "api_key", "apikey")
 
 
-def describe_call(tool_name: str, inp: dict) -> str:
+def describe_call(tool_name: str, inp: dict, limit: int | None = 200) -> str:
     """One-line-per-argument rendering of a proposed call, secrets withheld."""
     head = inp.get("command") or inp.get("file_path") or inp.get("skill_name") or inp.get("name") or ""
     shown = {"command", "file_path", "skill_name", "name"} if head else set()
@@ -398,7 +398,7 @@ def describe_call(tool_name: str, inp: dict) -> str:
             rendered = "[REDACTED]"
         else:
             text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
-            rendered = f"{text[:200]}... ({len(text)} chars)" if len(text) > 200 else text
+            rendered = f"{text[:limit]}... ({len(text)} chars)" if limit and len(text) > limit else text
         lines.append(f"  {key}={rendered}")
     return "\n".join([f"{tool_name}: {head}".rstrip(), *lines])
 
@@ -412,7 +412,7 @@ def build_write_proposal(tool_name: str, inp: dict) -> dict | None:
         path = _resolve_tool_path(display, must_exist=(tool_name == "edit_file"))
         if tool_name == "write_file":
             after = inp["content"]
-            diff = "\n".join(f"+ {line}" for line in after.split("\n")[:20])
+            diff = "\n".join(f"+ {line}" for line in after.split("\n"))
         else:
             if _looks_binary(path):
                 return None
@@ -560,6 +560,7 @@ def _truncate_result(result:str) -> str:
     original = legacy_result(result)
     shortened = ToolResult(shortened, original.status, changed=original.changed, approved=original.approved)
     shortened.fingerprint = StuckDetector.result_key("", str(result))
+    shortened.content_transition = original.content_transition
     return shortened
 
 
@@ -747,7 +748,8 @@ def check_permission(
 
     if mode == "dontAsk":
         return {"action": "deny", "message": f"Auto-denied (dontAsk mode): {confirm_message}"}
-    return {"action": "confirm", "message": confirm_message}
+    # "message" stays bounded for automated approvers; a human reviews the complete call.
+    return {"action": "confirm", "message": confirm_message, "review": describe_call(tool_name, inp, None)}
 
 
 
@@ -855,4 +857,3 @@ async def execute_tool(
 def reset_permission_cache() -> None:
     global _cached_rules
     _cached_rules = None
-

@@ -40,6 +40,16 @@ class SnapshotTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_snapshot({"app.py": {"content": "invalid!", "executable": False}})
 
+    def test_protection_rejects_missing_excluded_and_unsafe_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = DockerWorkspace(root / "source", root / "results")
+            workspace.before = {"tests/test_app.py": {"content": "", "executable": False}}
+            for name in ("../tests", "/tests", ".env", "missing", "tests/../tests", "tests//test_app.py"):
+                with self.subTest(name=name), self.assertRaises(ValueError):
+                    workspace.protected_paths = [name]
+                    workspace._protected_mounts()
+
     def test_results_cannot_be_inside_source(self):
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(ValueError):
@@ -208,6 +218,23 @@ class DockerTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertTrue(any(e.get("approved") is False for e in events))
 
+    async def test_large_sandbox_diff_is_flagged_and_saved_in_full(self):
+        agent = await self.make_agent()
+        agent.confirm_fn.return_value = True
+        content = "".join(f"line = {i}\n" for i in range(20000)) + "tail = 'end of change'\n"
+        await agent._execute_tool_call("read_file", {"file_path": "app.py"})
+        with patch("agents.agent.print_confirmation") as display:
+            result = await agent._execute_tool_call("write_file", {"file_path": "app.py", "content": content})
+        self.assertEqual(result.status, "success")
+        shown, _title, notice = display.call_args.args
+        self.assertNotIn("end of change", shown)
+        self.assertIn("PREVIEW INCOMPLETE", notice)
+        saved = next((self.workspace.output / "approvals").iterdir())
+        self.assertIn(str(saved), notice)
+        self.assertIn("+tail = 'end of change'", saved.read_text())
+        exported = await self.workspace.execute("read_file", {"file_path": "app.py", "offset": 20001}, {})
+        self.assertIn("end of change", exported)
+
     async def test_agent_loop_and_child_share_workspace_without_model_api(self):
         agent = await self.make_agent("acceptEdits")
 
@@ -266,6 +293,91 @@ class DockerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((target / "app.py").exists())
         self.assertEqual((target / "binary.dat").read_bytes(), bytes([0, 255, 1]))
         self.assertTrue((target / "exec.sh").stat().st_mode & 0o111)
+
+    async def test_cli_api_failure_exports_partial_work_before_cleanup(self):
+        from types import SimpleNamespace
+        from agents.sandbox_cli import run_task
+
+        args = SimpleNamespace(
+            workspace=str(self.source), output_dir=str(self.root / "api-failure"),
+            sandbox_image="miniagent-sandbox:1", task_timeout=30, model="test",
+            thinking=False, max_cost=None, max_turns=4, skill=[], no_memory=True,
+        )
+
+        async def fail_after_edit(agent, prompt):
+            read_state = {}
+            await agent.workspace.execute("read_file", {"file_path": "app.py"}, read_state)
+            await agent.workspace.execute(
+                "write_file", {"file_path": "app.py", "content": "value = 9\n"}, read_state,
+            )
+            raise RuntimeError("Simulated API failure")
+
+        with patch.object(Agent, "run_once", fail_after_edit):
+            with self.assertRaisesRegex(RuntimeError, "Simulated API failure"):
+                await run_task(args, "Fix", "https://invalid.test/v1", "test", True, "default")
+        folder = next((self.root / "api-failure").iterdir())
+        report = json.loads((folder / "result.json").read_text())
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["export_status"], "succeeded")
+        self.assertTrue(report["patch_generated"])
+        self.assertIn("value = 9", (folder / "changes.patch").read_text())
+        self.assertNotIn("value = 9", (self.source / "app.py").read_text())
+
+    async def test_acceptance_files_resist_shell_replacement_and_verification_is_independent(self):
+        from agents.verification import verify_candidate
+
+        tests = self.source / "tests"
+        tests.mkdir()
+        (tests / "test_app.py").write_text("from app import value\nassert value == 2\n")
+        (self.source / "single.py").write_text("trusted\n")
+        workspace = DockerWorkspace(self.source, self.root / "protected-results")
+        (self.source / "checks").mkdir()
+        (self.source / "checks" / "accept.py").write_text("trusted\n")
+        (self.source / "checks" / "helper.py").write_text("old\n")
+        workspace.protected_paths = ["tests", "single.py", "checks/accept.py"]
+        try:
+            await workspace.start()
+            for command in (
+                "echo tampered > tests/test_app.py",
+                "rm tests/test_app.py",
+                "mv tests old-tests",
+                "chmod u+w tests/test_app.py",
+                "chmod u+w tests",
+                "echo replacement > replacement; mv -f replacement single.py",
+                "rm single.py && ln -s app.py single.py",
+                "echo new > tests/new_test.py",
+                "mv checks old-checks",
+                "echo bad > checks/accept.py",
+                "ln single.py alias && echo bad > alias",
+            ):
+                with self.subTest(command=command):
+                    result = await workspace.execute("run_shell", {"command": command}, {})
+                    self.assertEqual(result.status, "error")
+            sibling = await workspace.execute("run_shell", {
+                "command": "echo new > checks/helper.py && echo extra > checks/new.py"}, {})
+            self.assertEqual(sibling.status, "success")
+            state = {}
+            await workspace.execute("read_file", {"file_path": "tests/test_app.py"}, state)
+            with self.assertRaises(ValueError):
+                await workspace.execute("write_file", {
+                    "file_path": "tests/test_app.py", "content": "pass\n"}, state)
+            await workspace.execute("read_file", {"file_path": "app.py"}, state)
+            await workspace.execute("write_file", {
+                "file_path": "app.py", "content": "value = 2\n"}, state)
+            await workspace.export_changes()
+            command = "PYTHONPATH=/workspace python tests/test_app.py"
+            passed = await verify_candidate(workspace, command)
+            self.assertEqual(passed["status"], "passed", passed)
+            # A poisoned original container cannot affect verification of the exported candidate.
+            await workspace.execute("run_shell", {"command": "echo 'value = 99' > app.py"}, {})
+            self.assertEqual((await verify_candidate(workspace, command))["status"], "passed")
+            await workspace.export_changes()
+            failed = await verify_candidate(workspace, command)
+            self.assertEqual(failed["status"], "failed", failed)
+            self.assertNotEqual(failed["exit_code"], 0)
+            self.assertEqual((tests / "test_app.py").read_text(), "from app import value\nassert value == 2\n")
+        finally:
+            await workspace.close()
 
     async def test_cli_task_exports_result_and_cleans_up(self):
         from types import SimpleNamespace
@@ -521,10 +633,7 @@ class DockerTests(unittest.IsolatedAsyncioTestCase):
                 await agent.workspace.close()
                 name, inp = "read_file", {"file_path": "app.py"}
             elif any(m.get("role") == "assistant" for m in agent._openai_messages):
-                self.assertFalse(agent._aborted)
-                return {"choices": [{"message": {
-                    "role": "assistant", "content": "Child could not inspect the workspace."
-                }}]}
+                self.fail("Parent called the model after the sandbox was lost")
             else:
                 name, inp = "agent", {"type": "explore", "prompt": "Inspect app.py"}
             return {"choices": [{"message": {
@@ -551,13 +660,12 @@ class DockerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(results["child"]["status"], "stopped")
         self.assertEqual(results["child"]["stop_reason"], "Sandbox unavailable")
-        self.assertEqual(results["parent"]["status"], "completed")
-        self.assertIsNone(results["parent"]["stop_reason"])
+        self.assertEqual(results["parent"]["status"], "stopped")
+        self.assertEqual(results["parent"]["stop_reason"], "Sandbox unavailable")
         folder = next((self.root / "unavailable-results").iterdir())
         report = json.loads((folder / "result.json").read_text())
         self.assertEqual(report["status"], "stopped")
         self.assertEqual(report["stop_reason"], "Sandbox unavailable")
-        self.assertIn("Child could not inspect", str(report["messages"]))
         self.assertNotIn("changes", report)
         self.assertFalse((folder / "changes.patch").exists())
         self.assertEqual((self.source / "app.py").read_text(), "value = 1\n")
@@ -597,6 +705,35 @@ class DockerTests(unittest.IsolatedAsyncioTestCase):
         text = await self.workspace.execute("read_file", {"file_path": "app.py"}, {})
         self.assertIn("value = 3", text)
         self.assertEqual((self.source / "app.py").read_text(), "value = 1\n")
+
+    async def test_file_round_trip_cycle_stops_with_real_container_metadata(self):
+        from agents.stuck_detector import StuckDetector
+
+        agent = await self.make_agent("bypassPermissions")
+        events = []
+        for i in range(16):
+            if i % 2 == 0:
+                name, args = "read_file", {"file_path": "app.py"}
+            else:
+                name = "write_file"
+                args = {"file_path": "app.py", "content": "value = 2\n" if i % 4 == 1 else "value = 1\n"}
+            raw = await agent._execute_tool_call(name, args)
+            if name == "write_file":
+                self.assertIsNotNone(raw.content_transition)
+                self.assertNotEqual(*raw.content_transition)
+            text = agent._observe_tool(name, args, raw)
+            if "Change approach" in text:
+                events.append((i + 1, "warn"))
+        self.assertEqual(events, [(12, "warn")])
+        self.assertTrue(agent._aborted)
+        self.assertEqual(agent._stop_reason, "alternating_cycle: 4-call cycle repeated 4 times")
+        self.assertEqual((self.source / "app.py").read_text(), "value = 1\n")
+        detector = StuckDetector()
+        for version in range(1, 10):
+            await self.workspace.execute("read_file", {"file_path": "app.py"}, self.state)
+            args = {"file_path": "app.py", "content": f"value = {version + 10}\n"}
+            raw = await self.workspace.execute("write_file", args, self.state)
+            self.assertIsNone(detector.observe("write_file", args, raw, version))
 
     async def test_cancelled_execution_destroys_container(self):
         import asyncio

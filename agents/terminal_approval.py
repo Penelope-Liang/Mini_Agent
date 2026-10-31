@@ -4,7 +4,7 @@ import asyncio
 import os
 import sys
 
-from .ui import print_plan_approval_options, print_plan_for_approval
+from .ui import print_confirmation, print_plan_approval_options, print_plan_for_approval
 
 
 async def read_terminal_line(prompt: str, limit: int = 4096) -> str | None:
@@ -55,8 +55,11 @@ class TerminalApproval:
             self.cancelled_while_waiting = True
             raise
 
-    async def __call__(self, _description: str) -> bool:
+    async def __call__(self, description: str, title: str | None = None, notice: str | None = None) -> bool:
+        # Display and answer share the lock so each answer belongs to the request shown above it.
         async with self._lock:
+            if title is not None:
+                print_confirmation(description, title, notice)
             answer = await self._read('  Allow? [y/N]: ')
             return answer is not None and answer.strip().lower() in {'y', 'yes'}
 

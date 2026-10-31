@@ -220,7 +220,7 @@ class StuckDetectorTests(unittest.TestCase):
 
 
 class StuckLoopTests(unittest.IsolatedAsyncioTestCase):
-    async def run_loop(self, backend, *, batch=False):
+    async def run_loop(self, backend, *, batch=False, alternating=False):
         import asyncio
         import json
         import tempfile
@@ -256,13 +256,13 @@ class StuckLoopTests(unittest.IsolatedAsyncioTestCase):
             async def response(**kwargs):
                 nonlocal count
                 count += 1
-                if count > 5:
+                if count > (9 if alternating else 5):
                     self.fail("Agent did not stop")
                 names = ["read_file"] * 4 + ["write_file"] if batch else ["read_file"]
                 calls = [
-                    (str(count) + "-" + str(i), name, {"file_path": "a"}) for i, name in enumerate(names)
+                    (str(count) + "-" + str(i), name, {"file_path": ("a" if count % 2 else "b") if alternating else "a"}) for i, name in enumerate(names)
                 ]
-                if count == 4:
+                if count == (7 if alternating else 4):
                     history = agent._openai_messages if backend == "openai" else agent._anthropic_messages
                     self.assertIn("Change approach", str(history))
                 if backend == "openai":
@@ -298,9 +298,10 @@ class StuckLoopTests(unittest.IsolatedAsyncioTestCase):
             agent._call_anthropic_stream = response
             result = await agent.run_once("Inspect")
             self.assertEqual(result["status"], "stopped")
-            self.assertIn("repeated_result", result["stop_reason"])
-            self.assertEqual(count, 1 if batch else 4)
-            self.assertEqual(dispatched, ["read_file"] * 4)
+            self.assertIn("alternating_cycle" if alternating else "repeated_result", result["stop_reason"])
+            expected = 8 if alternating else 4
+            self.assertEqual(count, 1 if batch else expected)
+            self.assertEqual(dispatched, ["read_file"] * expected)
             events = [json.loads(line) for line in (Path(directory) / "audit.jsonl").read_text().splitlines()]
             detection = [event for event in events if event["phase"] == "stuck_detection"]
             self.assertEqual([e["action"] for e in detection], ["warn", "stop"])
@@ -309,7 +310,11 @@ class StuckLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Change approach", str(history))
             if batch:
                 self.assertIn("Tool skipped: task stopped", str(history))
-            self.assertEqual(agent.tool_stats()["calls"], 4)
+            self.assertEqual(agent.tool_stats()["calls"], expected)
+
+    async def test_both_model_interfaces_stop_alternating_calls(self):
+        for backend in ["openai", "anthropic"]:
+            await self.run_loop(backend, alternating=True)
 
     async def test_both_model_interfaces_stop_after_warning(self):
         for backend in ["openai", "anthropic"]:

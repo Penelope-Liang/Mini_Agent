@@ -1,4 +1,4 @@
-"""Docker task workspace: no host mounts, no credentials, no local fallback.
+"""Docker task workspace: no original-source mounts, no credentials, no local fallback.
 
 Architecture references (not vendored code): SWE-ReX DockerDeployment and
 AutoGen DockerCommandLineCodeExecutor. Only the Docker CLI is required.
@@ -169,6 +169,42 @@ class DockerWorkspace:
         self.before = {}
         self.active = False
         self.lock = asyncio.Lock()
+        self.protected_paths = []
+
+    def _is_protected(self, name):
+        return any(name == p or name.startswith(p + "/") for p in self.protected_paths)
+
+    def _protected_mounts(self):
+        """Mount only sanitized acceptance snapshots, never the original repository."""
+        for name in self.protected_paths:
+            if not permitted_name(name) or not any(
+                f == name or f.startswith(name + "/") for f in self.before
+            ):
+                raise ValueError(f"Protected path is unsafe, excluded, or missing: {name!r}")
+        if not self.protected_paths:
+            return []
+        roots = sorted(set(self.protected_paths))
+        roots = [p for p in roots if not any(p.startswith(q + "/") for q in roots if p != q)]
+        copies = self.output / "acceptance"
+        for name, entry in self.before.items():
+            if not self._is_protected(name):
+                continue
+            path = copies / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(base64.b64decode(entry["content"]))
+            path.chmod(0o555 if entry["executable"] else 0o444)
+        # Writable ancestor mounts allow importing ordinary sibling files. Mountpoints themselves
+        # cannot be renamed, so replacing a parent cannot bypass a nested read-only mount.
+        parents = {str(p) for name in roots for p in PurePosixPath(name).parents if str(p) != "."}
+        mounts = []
+        for parent in sorted(parents, key=lambda p: (p.count("/"), p)):
+            mounts += ["--tmpfs", f"/workspace/{parent}:rw,nosuid,nodev,size=256m,uid=10001,gid=10001,mode=0700"]
+        for name in roots:
+            source = str(copies / name)
+            if "," in source or "," in name:
+                raise ValueError("Protected mount paths cannot contain commas")
+            mounts += ["--mount", f"type=bind,src={source},dst=/workspace/{name},readonly"]
+        return mounts
 
     async def _docker(self, *args, data=None, timeout=30, limit=48 * 1024 * 1024):
         process = await asyncio.create_subprocess_exec(
@@ -218,8 +254,8 @@ class DockerWorkspace:
             raise RuntimeError(f"Docker {args[0]} failed: {stderr.decode(errors='replace')[:2000]}")
         return stdout
 
-    async def start(self, resources=None):
-        self.before = await asyncio.to_thread(snapshot_source, self.source)
+    async def start(self, resources=None, *, snapshot=None):
+        self.before = validate_snapshot(snapshot) if snapshot is not None else await asyncio.to_thread(snapshot_source, self.source)
         self.output.mkdir(parents=True, exist_ok=False)
         try:
             await self._docker("info", "--format", "{{.ServerVersion}}")
@@ -254,10 +290,13 @@ class DockerWorkspace:
                 "/workspace:rw,nosuid,nodev,size=256m,uid=10001,gid=10001,mode=0700",
                 "--tmpfs",
                 "/tmp:rw,nosuid,nodev,size=64m,uid=10001,gid=10001,mode=0700",
+                *self._protected_mounts(),
                 self.image,
             )
             self.active = True
-            await self._request({"operation": "import", "files": self.before})
+            await self._request({"operation": "import", "files": {
+                n: e for n, e in self.before.items() if not self._is_protected(n)
+            }})
             if resources:
                 await self._request({"operation": "import", "files": resources})
         except BaseException:
@@ -332,6 +371,8 @@ class DockerWorkspace:
             changed=response.get("changed", False),
         )
         result.fingerprint = response.get("result_fingerprint")
+        if "content_transition" in response:
+            result.content_transition = tuple(response["content_transition"])
         return result
 
     async def export_changes(self):
@@ -339,6 +380,10 @@ class DockerWorkspace:
             response = await self._request({"operation": "snapshot"})
         # Runtime caches and credential-like filenames are never exported.
         after = validate_snapshot({k: v for k, v in response["files"].items() if permitted_name(k)})
+        if {n: e for n, e in after.items() if self._is_protected(n)} != {
+            n: e for n, e in self.before.items() if self._is_protected(n)
+        }:
+            raise ValueError("Protected acceptance files changed; refusing export")
         changed = {name: entry for name, entry in after.items() if self.before.get(name) != entry}
         deleted = sorted(self.before.keys() - after.keys())
         (self.output / "changes.json").write_text(
@@ -389,3 +434,4 @@ class DockerWorkspace:
                 import warnings
 
                 warnings.warn(f"Could not remove {self.name}: {exc}", RuntimeWarning)
+                return str(exc)

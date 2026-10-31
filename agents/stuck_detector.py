@@ -6,7 +6,7 @@ Independent implementation; no framework dependency. Fingerprints stay in memory
 import hashlib
 import json
 import re
-from collections import Counter
+from collections import Counter, deque
 
 
 class ToolResult(str):
@@ -18,6 +18,7 @@ class ToolResult(str):
         result.changed = changed
         result.approved = approved
         result.fingerprint = None
+        result.content_transition = None
         return result
 
 
@@ -38,16 +39,21 @@ def legacy_result(text):
 
 
 class StuckDetector:
-    def __init__(self, warn_at=3, stop_at=4):
+    def __init__(self, warn_at=3, stop_at=4, share_denials_with=None):
         if not isinstance(warn_at, int) or not isinstance(stop_at, int) or not 1 <= warn_at < stop_at:
             raise ValueError("Stuck thresholds must satisfy 1 <= warn_at < stop_at")
         self.warn_at, self.stop_at = warn_at, stop_at
         self.last_pair = self.last_error = None
         self.repeats = self.errors = 0
-        self.denials = Counter()
-        self.tool_denials = Counter()
+        # A user's refusals apply to the whole task, so sub-agents count against the parent's totals.
+        shared = share_denials_with
+        self.denials = shared.denials if shared is not None else Counter()
+        self.tool_denials = shared.tool_denials if shared is not None else Counter()
         self.child_stops = Counter()
         self.neutral = {}
+        self.cycle_history = deque(maxlen=4 * stop_at)
+        self._cycle_version = None
+        self._cycle_warning = None
 
     @staticmethod
     def call_key(name, args):
@@ -67,6 +73,53 @@ class StuckDetector:
         return hashlib.sha256(text.encode()).digest()
 
     def observe(self, name, args, result, version):
+        cycle = self._observe_cycle(name, args, result, version)
+        repeated = self._observe_repetition(name, args, result, version)
+        if repeated and repeated['action'] == 'stop':
+            return repeated
+        return cycle or repeated
+
+    def _observe_cycle(self, name, args, result, version):
+        # A tracked write may revisit old content despite a monotonically increasing version.
+        expected = self._cycle_version
+        if expected is not None:
+            expected += int(result.changed and result.content_transition is not None)
+        if (expected is not None and version != expected) or result.status in {'denied', 'stopped'}:
+            self.cycle_history.clear()
+            self._cycle_warning = None
+        self._cycle_version = version
+        if name == 'compact_context' or result.status in {'denied', 'stopped'}:
+            return None
+        if result.changed and result.content_transition is None:
+            self.cycle_history.clear()
+            self._cycle_warning = None
+            return None
+        signature = (self.call_key(name, args), result.status,
+                     result.fingerprint or self.result_key(name, str(result)), result.content_transition)
+        self.cycle_history.append(signature)
+        history = list(self.cycle_history)
+        for length in range(2, 5):
+            block = history[-length:]
+            if len(block) != length or len(set(block)) < 2:
+                continue
+            count = 1
+            while (count + 1) * length <= len(history):
+                if history[-(count + 1) * length:-count * length] != block:
+                    break
+                count += 1
+            event = self._event('alternating_cycle', count, self.warn_at, self.stop_at)
+            if event is None:
+                continue
+            # Rotations are the same loop, not new warnings on every tool call.
+            key = frozenset(tuple(block[i:] + block[:i]) for i in range(length))
+            if event['action'] == 'warn' and key == self._cycle_warning:
+                return None
+            self._cycle_warning = key
+            return {**event, 'cycle_length': length}
+        self._cycle_warning = None
+        return None
+
+    def _observe_repetition(self, name, args, result, version):
         call = self.call_key(name, args)
         if result.approved:
             self.denials.pop(call, None)

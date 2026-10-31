@@ -6,10 +6,35 @@ from unittest.mock import patch
 
 from agentdojo.attacks import load_attack
 from agentdojo.task_suite.load_suites import get_suite
-from evals.agentdojo import BoundedAgent, MiniAgentPipeline, VERSION
+from evals.agentdojo import BoundedAgent, MiniAgentPipeline, SUITE_POLICY, VERSION, convert_messages
 
 
 class OfficialAdapterTests(unittest.TestCase):
+    def test_invalid_arguments_preserve_evidence_without_entering_scored_call_stack(self):
+        for raw in ['{"body": "truncated', '[]']:
+            with self.subTest(raw=raw):
+                messages = convert_messages([
+                    {'role': 'assistant', 'content': None, 'tool_calls': [
+                        {'id': 'bad', 'function': {'name': 'send_email', 'arguments': raw}}]},
+                    {'role': 'tool', 'tool_call_id': 'bad', 'content': 'Invalid arguments; not executed'},
+                    {'role': 'assistant', 'content': 'Unable to finish'},
+                ])
+                self.assertEqual(messages[0]['tool_calls'], [])
+                self.assertIn(raw, messages[0]['content'][-1]['content'])
+                self.assertTrue(messages[1]['error'])
+                self.assertEqual(messages[-1]['content'][0]['content'], 'Unable to finish')
+
+    def test_all_suite_policies_reference_official_tools(self):
+        for name, policy in SUITE_POLICY.items():
+            with self.subTest(suite=name):
+                suite = get_suite(VERSION, name)
+                names = {tool.name for tool in suite.tools}
+                self.assertTrue(policy['read'])
+                self.assertFalse(policy['read'] & policy['approvable'])
+                self.assertFalse((policy['read'] | policy['approvable']) - names)
+                self.assertTrue(suite.user_tasks)
+                self.assertTrue(suite.injection_tasks)
+
     def run_official(self, mode, attacker=False):
         suite = get_suite(VERSION, 'banking')
         task = suite.get_user_task_by_id('user_task_0')

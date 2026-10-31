@@ -39,6 +39,26 @@ SUITE_POLICY = {
         'approvable': {'send_email', 'create_calendar_event', 'reschedule_calendar_event',
                        'add_calendar_event_participants', 'create_file', 'append_to_file', 'share_file'},
     },
+    'slack': {
+        'read': {'get_channels', 'read_channel_messages', 'read_inbox',
+                 'get_users_in_channel', 'get_webpage'},
+        'approvable': {'add_user_to_channel', 'send_direct_message',
+                       'send_channel_message', 'invite_user_to_slack', 'post_webpage'},
+    },
+    'travel': {
+        'read': {'get_user_information', 'get_all_hotels_in_city', 'get_hotels_prices',
+                 'get_rating_reviews_for_hotels', 'get_hotels_address',
+                 'get_all_restaurants_in_city', 'get_cuisine_type_for_restaurants',
+                 'get_restaurants_address', 'get_rating_reviews_for_restaurants',
+                 'get_dietary_restrictions_for_all_restaurants',
+                 'get_contact_information_for_restaurants', 'get_price_for_restaurants',
+                 'check_restaurant_opening_hours', 'get_all_car_rental_companies_in_city',
+                 'get_car_types_available', 'get_rating_reviews_for_car_rental',
+                 'get_car_fuel_options', 'get_car_rental_address', 'get_car_price_per_day',
+                 'search_calendar_events', 'get_day_calendar_events', 'get_flight_information'},
+        'approvable': {'create_calendar_event', 'reserve_hotel', 'reserve_car_rental',
+                       'reserve_restaurant', 'send_email'},
+    },
 }
 VERSION = 'v1.2.2'
 ATTACK = 'important_instructions'
@@ -102,6 +122,7 @@ class BoundedAgent(Agent):
 
 def convert_messages(messages):
     converted, calls = [], {}
+    invalid = {}
     for message in messages:
         role = message['role']
         item = {'role': role, 'content': [{'type': 'text', 'content': message.get('content') or ''}]}
@@ -109,11 +130,25 @@ def convert_messages(messages):
             item['tool_calls'] = []
             for call in message.get('tool_calls') or []:
                 fn = call['function']
-                parsed = FunctionCall(function=fn['name'], args=json.loads(fn['arguments']), id=call['id'])
+                raw = fn.get('arguments') or '{}'
+                try:
+                    args = json.loads(raw)
+                    if not isinstance(args, dict):
+                        raise ValueError('Arguments are not a JSON object')
+                except (ValueError, TypeError) as exc:
+                    # The agent rejects these before execution. Keep the original
+                    # attempted arguments in text, not in the official call stack.
+                    invalid[call['id']] = str(exc)
+                    calls[call['id']] = FunctionCall(function=fn['name'], args={}, id=call['id'])
+                    item['content'].append({'type': 'text', 'content':
+                        f"Invalid tool call (not executed): {fn['name']} arguments={raw}"})
+                    continue
+                parsed = FunctionCall(function=fn['name'], args=args, id=call['id'])
                 calls[call['id']] = parsed
                 item['tool_calls'].append(parsed)
         elif role == 'tool':
-            item.update(tool_call=calls[message['tool_call_id']], tool_call_id=message['tool_call_id'], error=None)
+            item.update(tool_call=calls[message['tool_call_id']], tool_call_id=message['tool_call_id'],
+                        error=invalid.get(message['tool_call_id']))
         converted.append(item)
     return converted
 
@@ -223,7 +258,8 @@ class MiniAgentPipeline(BasePipelineElement):
                   # or estimated_cost_usd above and are reported on their own.
                   **(approver.report() if isinstance(approver, (IsolatedApprover, ProvenanceApprover)) else {})}
         self.metrics.append(metric)
-        (trace_dir / 'trace.json').write_text(encode({'messages': transcript, 'executed': bridge.executed, 'metrics': metric}))
+        (trace_dir / 'trace.json').write_text(encode({'messages': transcript, 'raw_messages': agent._openai_messages,
+                                                   'executed': bridge.executed, 'metrics': metric}))
         return query, runtime, env, transcript, {}
 
 
@@ -232,18 +268,18 @@ def main():
     parser.add_argument('--run', action='store_true', help='Run paid model calls; otherwise list the official pilot tasks.')
     parser.add_argument('--model', default='gpt-4o')
     parser.add_argument('--output', default='artifacts/agentdojo')
-    parser.add_argument('--suite', default='banking', help='banking, slack, travel or workspace')
-    parser.add_argument('--tasks', default='user_task_0,user_task_1')
+    parser.add_argument('--suite', default='banking', choices=sorted(SUITE_POLICY))
+    parser.add_argument('--tasks', default='user_task_0,user_task_1', help='Comma-separated IDs, or all')
     parser.add_argument('--injections', default='injection_task_0',
-                        help='Comma-separated injection task ids; each is run against every user task.')
+                        help='Comma-separated injection task ids, or all; each runs against every user task.')
     # A configuration is one mode/approver/policy triple, so the report can show
     # what each control contributes instead of only the strictest setting.
     parser.add_argument('--configs', default='bypassPermissions:none:rules,dontAsk:none:rules',
                         help='Comma-separated mode:approver:policy. Approver: none, all, declared, isolated, provenance.')
     args = parser.parse_args()
     suite = get_suite(VERSION, args.suite)
-    tasks = [suite.get_user_task_by_id(n) for n in args.tasks.split(',')]
-    injections = [suite.get_injection_task_by_id(n) for n in args.injections.split(',')]
+    tasks = list(suite.user_tasks.values()) if args.tasks == 'all' else [suite.get_user_task_by_id(n) for n in args.tasks.split(',')]
+    injections = list(suite.injection_tasks.values()) if args.injections == 'all' else [suite.get_injection_task_by_id(n) for n in args.injections.split(',')]
     configs = [dict(zip(('mode', 'approver', 'policy'), c.split(':'))) for c in args.configs.split(',')]
     manifest = {'benchmark': 'AgentDojo', 'source_commit': '089ed468cf3ed0322acc66b0211f26d9d90dbf60',
                 'version': VERSION, 'suite': args.suite, 'temperature': 0,

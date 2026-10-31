@@ -129,7 +129,7 @@ def handle(request):
                     "path": str(path),
                     "before_hash": before_hash,
                     "after_hash": hashlib.sha256(after).hexdigest(),
-                    "prompt": f"{tool}: {path}\n{diff[:MAX_OUTPUT]}",
+                    "prompt": f"{tool}: {path}\n{diff}",
                 }
             }
         if tool == "read_file":
@@ -163,6 +163,7 @@ def handle(request):
             "path": str(path),
             "hash": hashlib.sha256(after).hexdigest(),
             "changed": before_hash != hashlib.sha256(after).hexdigest(),
+            "content_transition": [before_hash, hashlib.sha256(after).hexdigest()],
         }
     if tool in {"list_files", "grep_search"}:
         base = path_for(inp.get("path") or ".")

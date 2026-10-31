@@ -42,7 +42,7 @@ One sandbox task:
 
 ```text
 user input
-  -> snapshot selected source files (no host mounts)
+  -> snapshot selected source files (no original-source mounts)
   -> create restricted task container
   -> Agent.chat() on host, with model credentials on host
   -> model proposes a tool call
@@ -109,7 +109,7 @@ Results are saved outside the source, under `~/.miniagent/sandbox-runs/<task>/`:
 and `result.json` (status, transcript, tokens, cost, elapsed time). Nothing is automatically applied.
 After reviewing, the patch can be applied to a separate checkout with `git apply -p2 changes.patch`.
 
-The execution container is non-root, has no host mounts, no network, a read-only root filesystem,
+The execution container is non-root, has no original-source mounts, no network, a read-only root filesystem,
 and bounded writable tmpfs, memory, CPU, process count and task duration. Docker/image failures
 never fall back to local tools. Command timeout destroys the task container. Cancellation also
 cleans it up. Containers and their files are disposable; failed tasks may have no exported patch.
@@ -138,8 +138,22 @@ The task deadline includes approval waiting. A deadline during input produces `s
 Cancellation before the deadline reports `stopped` with `Task interrupted while waiting for approval`
 or `Task interrupted`, without assuming whether the user or another caller cancelled the task.
 Cancelled prompts detach their input listener and are recorded in the audit log as an unapproved
-authorization with outcome `cancelled-while-waiting`. Sandbox children currently receive no approval
-callback and deny operations requiring confirmation. Local library/evaluation callbacks are unchanged.
+authorization with outcome `cancelled-while-waiting`. Local library/evaluation callbacks are unchanged.
+
+Sub-agents ask through the same prompt, one request at a time. Each prompt title names its
+originator (`Main agent`, `Sub-agent #2 (explore)`); labels are assigned by the controller, and audit
+records carry `agent` and `parent_session_id`. Refusals are counted across the parent and its
+sub-agents. When a sub-agent stops on repeated refusals, or the sandbox is lost, the whole task stops
+with that reason; a sub-agent stopping for other reasons lets the parent try again, up to the usual
+repeated-stop limit.
+
+The prompt shows the request exactly as it will run. Model-written text is displayed literally:
+Rich markup is not interpreted, and terminal control or bidirectional-override characters are shown
+as visible escapes (`\x1b`, `\u202e`) without changing the executed arguments. Requests longer than
+40 lines or 4000 characters show a preview with a `PREVIEW INCOMPLETE` notice naming the full request,
+saved as `approvals/<call id>-<sha256 prefix>.txt` beside the audit log and recorded in the audit
+entry with its hash. If the full request cannot be saved, the operation is refused without asking.
+Opening the file does not approve anything. Allow a longer `--task-timeout` when reviewing large changes.
 
 ### Sandbox plan approval
 
@@ -359,3 +373,40 @@ Original contributions that Penelope Liang has the right to license are
 available under the [MIT License](LICENSE). This does not cover inherited
 code or third-party materials, including `data/`.
 The inherited code's licensing status remains unresolved.
+
+### Protected acceptance tests and independent verification
+
+For evaluation tasks, explicitly protect the files that define acceptance criteria:
+
+```bash
+python -m agents.main --workspace /path/to/project \
+  --protect-path tests --protect-path pyproject.toml \
+  --verify-command "python -m pytest -q tests" \
+  --verify-timeout 120 "Fix the reported issue without changing acceptance tests"
+```
+
+`--protect-path` accepts existing workspace-relative files or directories and can be repeated.
+It does not infer test names or accept globs. Missing, excluded, and unsafe paths fail closed.
+The controller creates sanitized copies under the run output's `acceptance/` directory and mounts
+only those copies read-only. The original repository is never mounted. Protection applies to shell
+commands, editor tools, and sub-agents even with automatic edit approval. Protect relevant fixtures
+and configuration explicitly as well; directory protection also prevents adding new files inside it.
+
+After a normally completed run exports its candidate, `--verify-command` runs in a fresh offline
+container with the original source snapshot plus exported changes and protected acceptance files.
+Model messages cannot choose the command or set its result. The command is trusted user input;
+review it before use. Verification has a separate deadline and does not consume model tokens.
+It does not run after a stopped/failed task or failed export. Verification containers are cleaned up.
+
+`result.json` preserves `status` as a compatibility alias for execution state and adds:
+- `execution_status`: `completed`, `stopped`, or `failed`.
+- `verification_status`: `passed`, `failed`, `error`, or `not_run`.
+- `verification`: configured command, exit code and bounded output, or the error/skipping reason.
+
+`completed` only means execution ended normally. `passed` means the configured command exited zero,
+not that all possible requirements are correct; command/test quality remains the evaluator's responsibility.
+Without a configured verifier, the status is `not_run`, regardless of the model's success claims.
+A verification failure or infrastructure error produces a nonzero CLI exit while preserving execution
+status and the patch. For formal benchmarks, use their official independent tests and grader.
+A fresh container and immutable tests do not prevent malicious candidate code from subverting an
+in-process test runner; this is not a general adversarial grading guarantee.

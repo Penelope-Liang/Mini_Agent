@@ -76,6 +76,7 @@ class TerminalApprovalTests(unittest.IsolatedAsyncioTestCase):
                 workspace = SimpleNamespace(
                     source=source, output=root / 'report', name='test', image='test', active=True,
                     start=AsyncMock(), close=AsyncMock(), execute=AsyncMock(),
+                    export_changes=AsyncMock(return_value={'changed': ['app.py']}),
                     normalize=lambda inp: inp,
                 )
                 workspace.output.mkdir()
@@ -85,9 +86,9 @@ class TerminalApprovalTests(unittest.IsolatedAsyncioTestCase):
                 ready = asyncio.Event()
                 original_approval = TerminalApproval.__call__
 
-                async def approval(approver, description):
+                async def approval(approver, *args):
                     ready.set()
-                    return await original_approval(approver, description)
+                    return await original_approval(approver, *args)
 
                 async def model_loop(agent, _prompt):
                     if waiting:
@@ -118,7 +119,9 @@ class TerminalApprovalTests(unittest.IsolatedAsyncioTestCase):
                             await asyncio.gather(task, return_exceptions=True)
                 workspace.execute.assert_not_awaited()
                 workspace.close.assert_awaited_once()
+                workspace.export_changes.assert_awaited_once()
                 report = json.loads((workspace.output / 'result.json').read_text())
+                self.assertEqual(report['export_status'], 'succeeded')
                 self.assertEqual(report['status'], 'stopped')
                 reason = 'Task interrupted' if cancel else 'Task timed out'
                 self.assertEqual(report['stop_reason'], reason + (' while waiting for approval' if waiting else ''))
@@ -185,31 +188,90 @@ class TerminalApprovalTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([(e['phase'], e['approved'], e['outcome']) for e in events],
                              [('authorization', False, 'cancelled-while-waiting')])
 
-    async def test_sandbox_children_do_not_inherit_approval(self):
+    async def test_sandbox_children_ask_the_user_with_program_assigned_labels(self):
         with tempfile.TemporaryDirectory() as directory:
-            workspace = SimpleNamespace(output=Path(directory))
-            confirm = AsyncMock(return_value=True)
-            parent = Agent(api_key='test', model='test', is_sub_agent=True,
-                           custom_system_prompt='Test', workspace=workspace, confirm_fn=confirm)
+            workspace = SimpleNamespace(output=Path(directory), active=True)
+            approval = TerminalApproval()
+            parent = Agent(api_key='test', model='test', custom_system_prompt='Test',
+                           workspace=workspace, confirm_fn=approval)
             self.addAsyncCleanup(parent._anthropic_client.close)
             seen = []
 
             async def run_child(child, _prompt):
-                self.assertIsNone(child.confirm_fn)
-                self.assertIs(child.workspace, workspace)
-                with patch('builtins.input', side_effect=AssertionError('Blocking input')):
-                    self.assertFalse(await child._confirm_dangerous('Test'))
-                seen.append(child)
+                self.assertIs(child.confirm_fn, approval)
+                self.assertIs(child._parent_stuck, parent._stuck)
+                self.assertTrue(await child._confirm_dangerous('rm build', 'Approve sandbox action'))
+                seen.append((child.agent_label, child.parent_session_id))
                 return {'status': 'completed', 'text': 'Done',
                         'tokens': {'input': 0, 'cached': 0, 'output': 0}}
 
-            with patch.object(Agent, 'run_once', run_child), patch('agents.skills.execute_skill', return_value={
-                'context': 'fork', 'allowed_tools': ['read_file'], 'prompt': 'Test',
-            }):
-                await parent._execute_agent_tool({'type': 'explore', 'prompt': 'Test'})
+            with (
+                patch.object(Agent, 'run_once', run_child),
+                patch('agents.skills.execute_skill', return_value={
+                    'context': 'fork', 'allowed_tools': ['read_file'], 'prompt': 'Test'}),
+                patch('agents.terminal_approval.read_terminal_line', new=AsyncMock(return_value='y')),
+                patch('agents.terminal_approval.print_confirmation') as display,
+            ):
+                await parent._execute_agent_tool({'type': 'explore', 'description': '[bold]Main agent[/bold]',
+                                                  'prompt': 'Test'})
                 await parent._execute_skill_tool({'skill_name': 'test'})
-            self.assertEqual(len(seen), 2)
-            confirm.assert_not_awaited()
+            self.assertEqual(seen, [('Sub-agent #1 (explore)', parent.session_id),
+                                    ('Sub-agent #2 (skill test)', parent.session_id)])
+            self.assertEqual([c.args for c in display.call_args_list], [
+                ('rm build', 'Approve sandbox action · Sub-agent #1 (explore)', None),
+                ('rm build', 'Approve sandbox action · Sub-agent #2 (skill test)', None)])
+
+    async def test_request_is_displayed_and_answered_under_one_lock(self):
+        approval = TerminalApproval()
+        order = []
+
+        async def read(_prompt):
+            order.append('read')
+            await asyncio.sleep(0.01)
+            return 'n'
+
+        with patch('agents.terminal_approval.read_terminal_line', read), \
+             patch('agents.terminal_approval.print_confirmation', lambda _d, title, _n: order.append(title)):
+            await asyncio.gather(approval('a', 'A'), approval('b', 'B'))
+        self.assertEqual(order, ['A', 'read', 'B', 'read'])
+
+    async def test_model_text_is_shown_literally_in_every_panel_field(self):
+        from rich.console import Console
+        from agents import ui
+
+        hostile = '[conceal]rm -rf data[/conceal] [/bold] [bold green]Safety check passed[/bold green]'
+        controls = 'a\x1b[2Kb\rc\u202ed'
+        console = Console(record=True)
+        with patch('agents.ui.console', console):
+            ui.print_confirmation(hostile + ' ' + controls, 'Approve · ' + hostile, 'notice ' + controls)
+            ui.print_plan_for_approval(hostile)
+            ui.print_sub_agent_start(hostile, hostile)
+            ui.print_tool_call('run_shell', {'command': hostile})
+        text = console.export_text()
+        flat = ''.join(c for c in text if not c.isspace() and c not in '│╭╮╰╯─')
+        self.assertEqual(flat.count('[conceal]rm-rfdata[/conceal]'), 6)
+        self.assertIn('[boldgreen]Safetycheckpassed[/boldgreen]', flat)
+        self.assertIn('a\\x1b[2Kb\\x0dc\\u202ed', text)
+        self.assertNotIn('\x1b', text)
+        self.assertNotIn('\u202e', text)
+
+    async def test_lost_sandbox_in_child_stops_parent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = SimpleNamespace(output=Path(directory), active=True)
+            parent = Agent(api_key='test', model='test', custom_system_prompt='Test', workspace=workspace)
+            self.addAsyncCleanup(parent._anthropic_client.close)
+
+            async def run_child(child, _prompt):
+                workspace.active = False
+                child._stop_reason, child._aborted = 'Sandbox unavailable', True
+                return {'status': 'stopped', 'stop_reason': 'Sandbox unavailable', 'text': '',
+                        'tokens': {'input': 0, 'cached': 0, 'output': 0}}
+
+            with patch.object(Agent, 'run_once', run_child):
+                result = await parent._execute_agent_tool({'type': 'explore', 'prompt': 'Test'})
+            self.assertEqual(result.status, 'stopped')
+            self.assertTrue(parent._aborted)
+            self.assertEqual(parent._stop_reason, 'Sandbox unavailable')
 
 
 class KeyboardInterruptTests(unittest.TestCase):

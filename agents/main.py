@@ -63,6 +63,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default=os.path.expanduser("~/.miniagent/sandbox-runs"),
                         help="Host results directory, outside the source repository")
     parser.add_argument("--task-timeout", type=float, default=600, help="Maximum task duration in seconds")
+    parser.add_argument("--protect-path", action="append", default=[],
+                        help="Protect an existing workspace-relative acceptance file or directory (repeatable)")
+    parser.add_argument("--verify-command", help="Trusted acceptance command run in a fresh sandbox after export")
+    parser.add_argument("--verify-timeout", type=float, default=120,
+                        help="Verification deadline in seconds, at most 120 (default: 120)")
     parser.add_argument("--help", "-h", action="store_true", help="Show help")
     return parser.parse_args()
 
@@ -348,6 +353,9 @@ Options:
   --sandbox-image IMG Trusted prebuilt execution image (default: miniagent-sandbox:1)
   --output-dir PATH   Results outside source (default: ~/.miniagent/sandbox-runs)
   --task-timeout N    Total task deadline in seconds (default: 600)
+  --protect-path P    Read-only acceptance file/directory, workspace-relative (repeatable)
+  --verify-command C  Trusted command to verify the exported candidate in a fresh sandbox
+  --verify-timeout N  Verification deadline, 0 < N <= 120 seconds (default: 120)
   --yolo, -y          Auto-allow ordinary tools; known dangerous commands still require approval
   --plan              Plan mode: read-only, describe changes without executing
   --accept-edits      Auto-approve edits; shell commands still require approval

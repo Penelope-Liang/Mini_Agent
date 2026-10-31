@@ -400,7 +400,7 @@ sets a stop reason and prevents further tool/model dispatch. These thresholds ar
 general sub-agents and Skill forks. Detection resets on a new `chat` task, never on context compaction.
 Existing tool statistics remain cumulative telemetry and do not control stopping.
 
-Three signals are checked:
+The following signals are checked:
 
 - Identical tool name, canonical JSON arguments, complete result fingerprint, and edit version.
 - Consecutive errors from the same call and version, even when error messages differ.
@@ -409,8 +409,16 @@ Three signals are checked:
   catch argument variations. Explicit human approval clears the matching call and that tool's denial
   total. Denials of other calls remain recorded. Simple unquoted shell whitespace is normalized;
   quoted strings, escapes and newlines retain their original semantics.
+- Repeated child stops, counted per entry tool. Denial counters are shared across parents and
+  children; a child reaching the refusal limit stops its parent immediately.
+- Alternating action/result cycles of length 2, 3, or 4. A bounded history (at most
+  `4 * stuck_stop_at` records) compares canonical calls, execution status, full result fingerprints,
+  and file-write before/after content fingerprints. The third complete repetition warns once;
+  the fourth stops: calls 6/8 for a two-call cycle, calls 12/16 for a four-call cycle.
+  Rotated versions of the same cycle do not produce additional warnings. Compaction is omitted
+  from this history without clearing it. Refusals and child stops retain their dedicated rules.
 
-Results carry `success`, `error` or `denied` metadata. Permission boundaries mark rejection explicitly;
+Results carry `success`, `error`, `denied` or `stopped` metadata. Permission boundaries mark rejection explicitly;
 container shell status comes from the exit code, and file failures from worker errors. Older local
 string-only handlers use a compatibility adapter for their known error prefixes, not arbitrary
 substring matching of returned content. The detector fingerprints the full returned result before
@@ -418,6 +426,10 @@ conversation truncation. Oversized shell output uses a fingerprint of the comple
 Only recognized pytest summary durations are normalized; arbitrary timestamps, paths and numbers
 are preserved. Stuck audit events contain tool name, pattern, count and action, never result/argument
 fingerprints or raw contents. Existing permission audit fields are separate.
+Alternating-cycle audit events additionally include `cycle_length`; content fingerprints remain
+in memory. File-write transitions allow detecting a return to previous content despite increasing
+edit versions. An unexplained version change or a write without transition metadata breaks the
+cycle history conservatively. Rebuild the execution image after updating the worker.
 
 Actual file-tool content changes advance a task edit version shared with children. Failed or identical
 writes do not advance it. Successful no-op writes and context compaction have separate repetition
@@ -430,24 +442,49 @@ recognized; their outputs are drained and retained. No subsequent batch/model ca
 result placeholders preserve protocol pairing for calls skipped after stopping.
 
 `run_once` returns `status` and `stop_reason` alongside text and tokens. Both child entry points return
-JSON containing these fields and partial text, allowing the parent to continue rather than treating a
-child stop as a task-wide exception. In sandbox CLI mode, a task is reported as completed only when
-`run_once` reports completion and the container is still available. When `run_once` returns normally
-after a stop (repetition detection or a budget/turn limit) and the container is still available, the
-existing patch is exported. On timeout, other exceptions, or after the container has been destroyed,
-only output already received is saved; no patch can be exported. A lost container is reported as
+JSON containing these fields and partial text. Ordinary child stops allow the parent to continue;
+repeated-refusal stops and an unavailable shared sandbox stop the parent immediately.
+In sandbox CLI mode, a task is reported as completed only when
+`run_once` reports completion and the container is still available. Finalization attempts export
+whenever the container remains available, including after timeout, cancellation, or an API error.
+Export has its own 45-second deadline, outside the task deadline. A shielded finalization task
+finishes export before cleanup; each resource close has a separate 20-second deadline. Export and
+cleanup errors do not replace the original task status or stop reason. The report records
+`export_status` (succeeded, failed, or skipped), `patch_generated`, and any `export_error` or
+`cleanup_errors`. An empty successfully generated patch still counts as generated, not as a fix.
+Cancellation during a workspace request can destroy the container to stop in-flight execution;
+in that case export is skipped. A lost container is reported as
 `stop_reason: Sandbox unavailable`, including when a child agent caused it. In every case
-`result.json` keeps previous tool/test output and a non-completed status, and the container is cleaned
-up. The CLI exits unsuccessfully to distinguish a stopped task from completion; tests are not rerun at
+`result.json` keeps previous tool/test output and the task status, and container cleanup is attempted.
+Report writing still requires a writable output directory. The CLI exits unsuccessfully on a stopped
+task or finalization failure; tests are not rerun at
 shutdown.
 
 Accepted limitations:
 
-- No A/B alternating-cycle detection. Unrelated real edits can advance the global edit version and
-  interrupt a result pattern; this is not a semantic measure of useful progress.
+- Alternating detection covers only exact repeated cycles of 2-4 recorded calls within one Agent,
+  not longer or arbitrary interleaved loops or semantic progress. Child cycle histories are separate.
+  Legitimate repeated workflows may match; configurable thresholds and hard budgets still apply.
 - No complete tracking of filesystem changes caused by shell commands. Shell calls rely on returned
   output and exit status; identical-output polling or silent filesystem changes can be misclassified.
   Legitimate unchanged polling may stop on the fourth observation; raise thresholds when appropriate.
 - Error-prefix adaptation remains for legacy local handlers, and conservative normalization may miss
   repetition involving changing timestamps or temporary paths. The detector does not establish that
   every repeated operation is useless or that every non-repeated operation makes progress.
+
+
+### Acceptance protection and verification results
+
+The sandbox controller accepts explicit `--protect-path` entries. It materializes only validated
+snapshot files into dedicated acceptance copies and bind-mounts them read-only. Writable ancestor
+tmpfs mounts permit ordinary sibling edits; protected mountpoints and their ancestors cannot be
+renamed to substitute a writable tree. No source repository or credentials are mounted. Export
+also compares protected content and modes against the original snapshot and fails on any mismatch.
+
+`agents/verification.py` applies exported changes to the in-memory original snapshot and starts a
+fresh `DockerWorkspace`. The configured host-side verification command executes without the model
+or old task processes. Acceptance paths retain the same protections. Each verification container
+is closed even when startup, test execution, or timeout fails. The CLI keeps execution state separate
+from verification state and never parses model prose or ordinary tool output as proof of success.
+The configured command's exit code is the validation boundary; this does not establish semantic
+correctness beyond that command or defend against arbitrary test-runner subversion by candidate code.

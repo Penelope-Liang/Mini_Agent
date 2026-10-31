@@ -15,11 +15,69 @@ from .terminal_approval import TerminalApproval
 from .tools import tool_definitions
 from .ui import print_error, print_info
 from .workspace import DockerWorkspace
+from .verification import verify_candidate
+
+
+EXPORT_TIMEOUT = 45
+CLEANUP_TIMEOUT = 20
+
+
+async def _finalize_task(workspace, agent, status, started, use_openai):
+    """Save partial work before releasing resources, outside the task deadline."""
+    status.update(export_status="skipped", patch_generated=False)
+    if workspace.active:
+        try:
+            async with asyncio.timeout(EXPORT_TIMEOUT):
+                status["changes"] = await workspace.export_changes()
+            status.update(export_status="succeeded", patch_generated=True)
+            print_info(f"Changes exported to {workspace.output}; original files were not modified.")
+        except Exception as exc:
+            status.update(export_status="failed", export_error=f"{type(exc).__name__}: {exc}")
+    else:
+        status["export_error"] = "Sandbox unavailable"
+
+    status["execution_status"] = status["status"]
+    status["verification_status"] = "not_run"
+    status["verification"] = {"status": "not_run", "reason": "No verification command configured"}
+    if status.get("verification_command"):
+        if status["status"] == "completed" and status["export_status"] == "succeeded":
+            status["verification"] = await verify_candidate(
+                workspace, status["verification_command"], status["verification_timeout"]
+            )
+            status["verification_status"] = status["verification"]["status"]
+        else:
+            status["verification"]["reason"] = "Execution did not complete or export failed"
+    print_info(f"Execution: {status['execution_status']}; verification: {status['verification_status']}")
+
+    if agent:
+        if agent.plan_content is not None:
+            status["plan"] = agent.plan_content
+        status["tokens"] = agent.get_token_usage()
+        status["estimated_cost_usd"] = agent._get_current_cost_usd()
+        status["messages"] = agent._openai_messages if use_openai else agent._anthropic_messages
+
+    resources = [("workspace", workspace), ("context7", workspace.context7)]
+    if agent:
+        resources.append(("model_client", agent._openai_client or agent._anthropic_client))
+    for name, resource in resources:
+        if resource is None:
+            continue
+        try:
+            async with asyncio.timeout(CLEANUP_TIMEOUT):
+                error = await resource.close()
+            if isinstance(error, str):
+                status.setdefault("cleanup_errors", {})[name] = error
+        except Exception as exc:
+            status.setdefault("cleanup_errors", {})[name] = f"{type(exc).__name__}: {exc}"
+    status["seconds"] = time.monotonic() - started
+    if workspace.output.exists():
+        (workspace.output / "result.json").write_text(json.dumps(status, ensure_ascii=False, indent=2))
 
 
 async def run_task(args, prompt, api_base, api_key, use_openai, permission_mode):
     workspace = DockerWorkspace(Path(args.workspace), Path(args.output_dir), args.sandbox_image)
     workspace.context7 = None
+    workspace.protected_paths = list(getattr(args, "protect_path", []))
     agent = None
     approval = TerminalApproval()
     deadline = asyncio.timeout(args.task_timeout)
@@ -30,6 +88,9 @@ async def run_task(args, prompt, api_base, api_key, use_openai, permission_mode)
         "source": str(workspace.source),
         "container": workspace.name,
         "image": workspace.image,
+        "protected_paths": workspace.protected_paths,
+        "verification_command": getattr(args, "verify_command", None),
+        "verification_timeout": getattr(args, "verify_timeout", 120),
     }
     try:
         async with deadline:
@@ -70,16 +131,16 @@ async def run_task(args, prompt, api_base, api_key, use_openai, permission_mode)
                 audit_path=str(workspace.output / "audit.jsonl"),
             )
             agent.set_plan_approval_fn(approval.plan)
-            result = await agent.run_once(prompt + context["text"])
+            protection = ""
+            if workspace.protected_paths:
+                protection = "\nAcceptance paths are read-only and must not be changed: " + ", ".join(workspace.protected_paths)
+            result = await agent.run_once(prompt + context["text"] + protection)
             status.update(result)
             status["status"] = (
                 "stopped" if result.get("status") == "stopped" or not workspace.active else "completed"
             )
             if not workspace.active and not status.get("stop_reason"):
                 status["stop_reason"] = "Sandbox unavailable"
-            if workspace.active:
-                status["changes"] = await workspace.export_changes()
-                print_info(f"Changes exported to {workspace.output}; original files were not modified.")
             if status["status"] != "completed":
                 raise RuntimeError("Task stopped before completion; inspect result.json")
     except BaseException as exc:
@@ -101,20 +162,20 @@ async def run_task(args, prompt, api_base, api_key, use_openai, permission_mode)
         )
         raise
     finally:
-        await workspace.close()
-        if workspace.context7 is not None:
-            await workspace.context7.close()
-        if agent:
-            if agent.plan_content is not None:
-                status["plan"] = agent.plan_content
-            client = agent._openai_client or agent._anthropic_client
-            await client.close()
-            status["tokens"] = agent.get_token_usage()
-            status["estimated_cost_usd"] = agent._get_current_cost_usd()
-            status["messages"] = agent._openai_messages if use_openai else agent._anthropic_messages
-        status["seconds"] = time.monotonic() - started
-        if workspace.output.exists():
-            (workspace.output / "result.json").write_text(json.dumps(status, ensure_ascii=False, indent=2))
+        finalizer = asyncio.create_task(_finalize_task(workspace, agent, status, started, use_openai))
+        cancelled = False
+        while not finalizer.done():
+            try:
+                await asyncio.shield(finalizer)
+            except asyncio.CancelledError:
+                cancelled = True
+        finalizer.result()
+        if cancelled:
+            raise asyncio.CancelledError
+    if status["export_status"] == "failed" or status.get("cleanup_errors"):
+        raise RuntimeError("Task finalization failed; inspect result.json")
+    if status["verification_status"] in {"failed", "error"}:
+        raise RuntimeError("Candidate verification did not pass; inspect result.json")
 
 
 def run_cli(args, api_base, api_key, use_openai, permission_mode):
@@ -122,6 +183,8 @@ def run_cli(args, api_base, api_key, use_openai, permission_mode):
         raise ValueError("--resume is unavailable: each sandbox task starts from a fresh source copy")
     if args.task_timeout <= 0:
         raise ValueError("--task-timeout must be positive")
+    if not 0 < getattr(args, "verify_timeout", 120) <= 120:
+        raise ValueError("--verify-timeout must be greater than zero and at most 120 seconds")
     prompt = " ".join(args.prompt)
     if prompt:
         asyncio.run(run_task(args, prompt, api_base, api_key, use_openai, permission_mode))

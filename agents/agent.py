@@ -3,6 +3,7 @@ from __future__ import annotations
 from .stuck_detector import StuckDetector, ToolResult, legacy_result
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -29,11 +30,14 @@ from agents.session_memory import (
 )
 from agents.session import save_folded_session_memory, save_session
 from agents.subagent import get_sub_agent_config
+from agents.terminal_approval import TerminalApproval
 from agents.tools import ToolDef, tool_definitions, execute_tool, CONCURRENCY_SAFE_TOOLS, check_permission, \
     get_active_tool_definitions, build_write_proposal, stale_proposal_reason, current_content_hash
 from agents.ui import print_info, print_divider, print_assistant_text, print_sub_agent_start, print_sub_agent_end, \
     start_spinner, stop_spinner, print_cost, print_tool_call, print_tool_result, print_confirmation, print_retry, \
     print_error
+
+APPROVAL_PREVIEW_LINES, APPROVAL_PREVIEW_CHARS = 40, 4000
 
 
 # Exponential backoff retry
@@ -172,8 +176,13 @@ class Agent:
                  stuck_warn_at: int = 3, stuck_stop_at: int = 4,):
         self.stuck_warn_at, self.stuck_stop_at = stuck_warn_at, stuck_stop_at
         self._stuck = StuckDetector(stuck_warn_at, stuck_stop_at)
-        self._stop_reason = None
+        self._parent_stuck = None
+        self._stop_reason = self._stop_pattern = None
         self._progress = {"version": 0}
+        # Identity shown on approval prompts and audit records; assigned by the program, never by the model.
+        self.agent_label = "Main agent"
+        self.parent_session_id = None
+        self._agent_numbers = {"next": 1}
         self.workspace = workspace
         self.permission_mode = permission_mode
         self.thinking = thinking
@@ -468,8 +477,8 @@ class Agent:
             )
 
         self._aborted = False
-        self._stop_reason = None
-        self._stuck = StuckDetector(self.stuck_warn_at, self.stuck_stop_at)
+        self._stop_reason = self._stop_pattern = None
+        self._stuck = StuckDetector(self.stuck_warn_at, self.stuck_stop_at, self._parent_stuck)
         self._turn_output_buffer = []
         coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
         self._current_task = asyncio.create_task(coro)
@@ -575,8 +584,10 @@ class Agent:
         self._audit_permission({"phase": "stuck_detection", "session_id": self.session_id,
                                 "tool": name, **event})
         reason = f"{event['pattern']} for {name} ({event['count']} observations)"
+        if event['pattern'] == 'alternating_cycle':
+            reason = f"alternating_cycle: {event['cycle_length']}-call cycle repeated {event['count']} times"
         if event["action"] == "stop":
-            self._stop_reason = reason
+            self._stop_reason, self._stop_pattern = reason, event["pattern"]
             self._aborted = True
             message = "Task stopped: " + reason
             self._emit_text("\n" + message + "\n")
@@ -1210,6 +1221,7 @@ class Agent:
     # Tool execution entry point
 
     def _audit_permission(self, event: dict) -> None:
+        event = {"agent": self.agent_label, "parent_session_id": self.parent_session_id, **event}
         self.audit_path.parent.mkdir(parents=True, exist_ok=True)
         with self.audit_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(event, ensure_ascii=False) + "\n")
@@ -1221,12 +1233,42 @@ class Agent:
         before = current_content_hash(path) if path else None
         result = legacy_result(await self._execute_tool_impl(name, inp))
         if path and result.status == "success":
-            result.changed = before != current_content_hash(path)
+            after = current_content_hash(path)
+            result.changed = before != after
+            result.content_transition = (before, after)
         return result
 
-    async def _request_approval(self, event: dict, prompt: str, title: str) -> bool:
+    def _approval_preview(self, event: dict, review: str) -> tuple[str, str | None]:
+        """What the panel shows, plus a notice naming the saved full request when it is cut."""
+        lines = review.split("\n")
+        preview = "\n".join(lines[:APPROVAL_PREVIEW_LINES])[:APPROVAL_PREVIEW_CHARS]
+        if preview == review:
+            return review, None
+        data = _safe_utf8_text(review).encode("utf-8")
+        digest = hashlib.sha256(data).hexdigest()
+        # Named by this request's id and content hash, in the host-owned results folder.
+        path = self.audit_path.parent / "approvals" / f"{event['call_id']}-{digest[:12]}.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise OSError(f"Saved approval request does not match: {path}")
+        event["review_file"] = {"path": str(path), "sha256": digest}
+        hidden_lines = len(lines) - preview.count("\n") - 1
+        notice = (f"PREVIEW INCOMPLETE: {len(review) - len(preview)} more characters "
+                  f"({hidden_lines} more lines) are not shown above.\n"
+                  f"Full request: {path}\nsha256: {digest}\n"
+                  "Review the full request before answering. Opening it does not approve it.")
+        return preview, notice
+
+    async def _request_approval(self, event: dict, prompt: str, title: str, review: str | None = None) -> bool:
         try:
-            return await self._confirm_dangerous(prompt, title)
+            display, notice = self._approval_preview(event, review or prompt)
+        except OSError as exc:
+            # The user cannot approve what they have no way to see in full.
+            event["review_file_error"] = str(exc)
+            return False
+        try:
+            return await self._confirm_dangerous(prompt, title, display, notice)
         except asyncio.CancelledError:
             # An audit failure must not replace the cancellation that stops the task.
             try:
@@ -1256,7 +1298,8 @@ class Agent:
                     event["proposal"] = {k: proposal[k] for k in ("path", "before_hash", "after_hash")}
                 allowed = await self._request_approval(
                     event, proposal["prompt"] if proposal else permission["message"],
-                    "Approve this change" if proposal else "Dangerous command")
+                    "Approve this change" if proposal else "Dangerous command",
+                    None if proposal else permission.get("review"))
                 event["approved"] = allowed
             # Persist authorization before executing; audit failure prevents execution.
             self._audit_permission({**event, "phase": "authorization"})
@@ -1310,7 +1353,8 @@ class Agent:
                     proposal = await self.workspace.prepare(name, inp)
                     event['proposal'] = {k: proposal[k] for k in ('path', 'before_hash', 'after_hash')}
                 allowed = await self._request_approval(
-                    event, proposal['prompt'] if proposal else permission['message'], 'Approve sandbox action')
+                    event, proposal['prompt'] if proposal else permission['message'], 'Approve sandbox action',
+                    None if proposal else permission.get('review'))
                 event['approved'] = allowed
             self._audit_permission({**event, 'phase': 'authorization'})
             if not allowed:
@@ -1396,14 +1440,15 @@ class Agent:
                 custom_tools=tools,
                 is_sub_agent=True,
                 permission_mode=self.permission_mode,
-                confirm_fn=None if self.workspace is not None else self.confirm_fn,
+                confirm_fn=self.confirm_fn,
                 audit_path=str(self.audit_path),
                 workspace=self.workspace,
                 stuck_warn_at=self.stuck_warn_at, stuck_stop_at=self.stuck_stop_at,
             )
             try:
-                sub_agent._progress = self._progress
+                self._link_sub_agent(sub_agent, f"skill {inp.get('skill_name', '')}")
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
+                self._propagate_child_stop(sub_agent)
                 self.total_input_tokens += sub_result["tokens"]["input"]
                 self.total_cached_input_tokens += sub_result["tokens"]["cached"]
                 self.total_output_tokens += sub_result["tokens"]["output"]
@@ -1475,6 +1520,27 @@ class Agent:
         self._fold_last_time = 0.0
         self._fold_count = 0
 
+    def _link_sub_agent(self, sub_agent: "Agent", kind: str) -> None:
+        number = self._agent_numbers["next"]
+        self._agent_numbers["next"] += 1
+        sub_agent._agent_numbers = self._agent_numbers
+        sub_agent.agent_label = f"Sub-agent #{number} ({str(kind)[:40]})"
+        sub_agent.parent_session_id = self.session_id
+        sub_agent._progress = self._progress
+        sub_agent._parent_stuck = self._stuck
+
+    def _propagate_child_stop(self, sub_agent: "Agent") -> None:
+        # Repeated refusals and a lost sandbox end the task; other child stops are counted by _observe_tool.
+        if self.workspace is not None and not self.workspace.active:
+            reason, pattern = "Sandbox unavailable", None
+        elif sub_agent._stop_pattern in {"repeated_denial", "tool_denial_total"}:
+            reason, pattern = f"{sub_agent.agent_label}: {sub_agent._stop_reason}", sub_agent._stop_pattern
+        else:
+            return
+        self._stop_reason = self._stop_reason or reason
+        self._stop_pattern = self._stop_pattern or pattern
+        self._aborted = True
+
     async def _execute_agent_tool(self, inp:dict) -> str:
         agent_type = inp.get("type", "general")
         description = inp.get("description", "sub-agent task")
@@ -1492,14 +1558,15 @@ class Agent:
             custom_tools=[t for t in config["tools"] if t["name"] in {p["name"] for p in self.tools}],
             is_sub_agent=True,
             permission_mode=self.permission_mode,
-            confirm_fn=None if self.workspace is not None else self.confirm_fn,
+            confirm_fn=self.confirm_fn,
             audit_path=str(self.audit_path),
             workspace=self.workspace,
             stuck_warn_at=self.stuck_warn_at, stuck_stop_at=self.stuck_stop_at,
         )
         try:
-            sub_agent._progress = self._progress
+            self._link_sub_agent(sub_agent, agent_type)
             result = await sub_agent.run_once(prompt)
+            self._propagate_child_stop(sub_agent)
             self.total_input_tokens += result["tokens"]["input"]
             self.total_cached_input_tokens += result["tokens"]["cached"]
             self.total_output_tokens += result["tokens"]["output"]
@@ -2044,8 +2111,13 @@ class Agent:
 
         return await _with_retry(_do)
 
-    async def _confirm_dangerous(self, command: str, title: str = "Dangerous command") -> bool:
-        print_confirmation(command, title)
+    async def _confirm_dangerous(self, command: str, title: str = "Dangerous command",
+                                 display: str | None = None, notice: str | None = None) -> bool:
+        title = f"{title} · {self.agent_label}"
+        shown = command if display is None else display
+        if isinstance(self.confirm_fn, TerminalApproval):
+            return await self.confirm_fn(shown, title, notice)
+        print_confirmation(shown, title, notice)
         if self.confirm_fn:
             return await self.confirm_fn(command)
         if self.is_sub_agent:

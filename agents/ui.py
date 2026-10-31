@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 import threading
 import time
@@ -9,6 +10,7 @@ import time
 from rich import box
 from rich.align import Align
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -20,6 +22,22 @@ console = Console(highlight=False)
 
 def _safe_text(value: object) -> str:
     return str(value).encode("utf-8", errors="replace").decode("utf-8")
+
+
+# Terminal controls (ESC, CR, C1) and bidi overrides can hide or reorder what the user reads.
+_UNSAFE_CHARS = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def terminal_safe(value: object) -> str:
+    """Display-only rendering of untrusted text: controls become visible escapes."""
+    return _UNSAFE_CHARS.sub(
+        lambda m: f"\\x{ord(m.group()):02x}" if ord(m.group()) < 0x100 else f"\\u{ord(m.group()):04x}",
+        _safe_text(value),
+    )
+
+
+def _plain(value: object) -> Text:
+    return Text(terminal_safe(value))
 
 
 def _safe_stdout_write(text: object) -> None:
@@ -74,9 +92,9 @@ def print_tool_call(name: str, inp: dict) -> None:
     table = Table.grid(padding=(0, 1))
     table.add_column(style="bold yellow", no_wrap=True)
     table.add_column(style="white")
-    table.add_row("tool", f"{icon} {name}")
+    table.add_row("tool", _plain(f"{icon} {name}"))
     if summary:
-        table.add_row("input", _safe_text(summary))
+        table.add_row("input", _plain(summary))
     console.print(Panel(
         table,
         title="[bold yellow]Tool Call[/bold yellow]",
@@ -96,8 +114,8 @@ def print_tool_result(name: str, result: str) -> None:
     if len(result) > max_len:
         truncated = result[:max_len] + f"\n  ... ({len(result)} chars total)"
     console.print(Panel(
-        _safe_text(truncated),
-        title=f"[dim]{name} result[/dim]",
+        _plain(truncated),
+        title=f"[dim]{escape(terminal_safe(name))} result[/dim]",
         border_style="dim",
         box=box.ROUNDED,
         padding=(0, 1),
@@ -107,7 +125,7 @@ def print_tool_result(name: str, result: str) -> None:
 def _print_file_change_result(_name: str, result: str) -> None:
     lines = result.split("\n")
     console.print(Panel(
-        _safe_text(lines[0]),
+        _plain(lines[0]),
         title="[bold green]File Change[/bold green]",
         border_style="green",
         box=box.ROUNDED,
@@ -121,21 +139,16 @@ def _print_file_change_result(_name: str, result: str) -> None:
     for line in display_lines:
         if not line.strip():
             continue
-        if line.startswith("@@"):
-            console.print(f"[cyan]  {line}[/cyan]")
-        elif line.startswith("- "):
-            console.print(f"[red]  {line}[/red]")
-        elif line.startswith("+ "):
-            console.print(f"[green]  {line}[/green]")
-        else:
-            console.print(f"[dim]  {line}[/dim]")
+        style = ("cyan" if line.startswith("@@") else "red" if line.startswith("- ")
+                 else "green" if line.startswith("+ ") else "dim")
+        console.print(Text("  " + terminal_safe(line), style=style))
     if len(content_lines) > max_display:
         console.print(f"[dim]  ... ({len(content_lines) - max_display} more lines)[/dim]")
 
 
 def print_error(msg: str) -> None:
     console.print(Panel(
-        _safe_text(msg),
+        _plain(msg),
         title="[bold red]Error[/bold red]",
         border_style="red",
         box=box.ROUNDED,
@@ -143,10 +156,13 @@ def print_error(msg: str) -> None:
     ))
 
 
-def print_confirmation(command: str, title: str = "Dangerous command") -> None:
+def print_confirmation(command: str, title: str = "Dangerous command", notice: str | None = None) -> None:
+    body = _plain(command)
+    if notice:
+        body.append("\n\n" + terminal_safe(notice), style="bold red")
     console.print(Panel(
-        _safe_text(command),
-        title=f"[bold yellow]{title}[/bold yellow]",
+        body,
+        title=f"[bold yellow]{escape(terminal_safe(title))}[/bold yellow]",
         border_style="yellow",
         box=box.ROUNDED,
         padding=(0, 1),
@@ -173,7 +189,7 @@ def print_retry(attempt: int, max_retries: int, reason: str) -> None:
 
 def print_info(msg: str) -> None:
     console.print(Panel(
-        _safe_text(msg),
+        _plain(msg),
         title="[bold cyan]Info[/bold cyan]",
         border_style="cyan",
         box=box.ROUNDED,
@@ -183,7 +199,7 @@ def print_info(msg: str) -> None:
 
 def print_warning(msg: str) -> None:
     console.print(Panel(
-        _safe_text(msg),
+        _plain(msg),
         title="[bold yellow]Notice[/bold yellow]",
         border_style="yellow",
         box=box.ROUNDED,
@@ -245,7 +261,7 @@ def stop_spinner() -> None:
 
 def print_plan_for_approval(plan_content: str) -> None:
     console.print(Panel(
-        _safe_text(plan_content),
+        _plain(plan_content),
         title="[bold cyan]Plan for Approval[/bold cyan]",
         border_style="cyan",
         box=box.ROUNDED,
@@ -269,8 +285,8 @@ def print_plan_approval_options() -> None:
 
 def print_sub_agent_start(agent_type: str, description: str) -> None:
     console.print(Panel(
-        _safe_text(description),
-        title=f"[bold magenta]Sub-agent started: {agent_type}[/bold magenta]",
+        _plain(description),
+        title=f"[bold magenta]Sub-agent started: {escape(terminal_safe(agent_type))}[/bold magenta]",
         border_style="magenta",
         box=box.ROUNDED,
         padding=(0, 1),
@@ -279,8 +295,8 @@ def print_sub_agent_start(agent_type: str, description: str) -> None:
 
 def print_sub_agent_end(agent_type: str, _description: str, status: str = "completed") -> None:
     console.print(Panel(
-        status,
-        title=f"[bold magenta]Sub-agent finished: {agent_type}[/bold magenta]",
+        _plain(status),
+        title=f"[bold magenta]Sub-agent finished: {escape(terminal_safe(agent_type))}[/bold magenta]",
         border_style="magenta",
         box=box.ROUNDED,
         padding=(0, 1),

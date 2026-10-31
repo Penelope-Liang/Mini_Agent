@@ -42,8 +42,8 @@ class PermissionTests(unittest.IsolatedAsyncioTestCase):
     async def read(self, agent):
         return await agent._execute_tool_call('read_file', {'file_path': str(self.file)})
 
-    async def write(self, agent, path=None):
-        return await agent._execute_tool_call('write_file', {'file_path': str(path or self.file), 'content': 'changed'})
+    async def write(self, agent, path=None, content='changed'):
+        return await agent._execute_tool_call('write_file', {'file_path': str(path or self.file), 'content': content})
 
     async def test_plan_blocks_writes_shell_and_skill_mutation_without_side_effects(self):
         agent = self.agent()
@@ -385,6 +385,121 @@ class PermissionTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIn('Change approach', text)
                 self.assertTrue(parent._aborted)
                 self.assertIn('repeated_child_stop', parent._stop_reason)
+
+    async def test_cut_preview_is_flagged_and_full_request_saved_while_execution_is_unchanged(self):
+        agent = self.agent('default', ['read_file', 'write_file'])
+        agent.confirm_fn = AsyncMock(return_value=True)
+        content = ''.join(f'line {i}\n' for i in range(100)) + 'hidden \x1b[2K[conceal]payload[/conceal]\n'
+        await self.read(agent)
+        with patch('agents.agent.print_confirmation') as display:
+            result = await self.write(agent, content=content)
+        self.assertEqual(result.status, 'success')
+        self.assertEqual(self.file.read_text(), content)
+        shown, _title, notice = display.call_args.args
+        self.assertNotIn('payload', shown)
+        self.assertIn('PREVIEW INCOMPLETE', notice)
+        event = next(e for e in map(json.loads, self.audit.read_text().splitlines())
+                     if e['phase'] == 'authorization' and e['tool'] == 'write_file')
+        saved = Path(event['review_file']['path'])
+        self.assertEqual(saved.parent, self.root / 'approvals')
+        self.assertTrue(saved.name.startswith(event['call_id']))
+        self.assertIn(str(saved), notice)
+        self.assertEqual(hashlib.sha256(saved.read_bytes()).hexdigest(), event['review_file']['sha256'])
+        self.assertIn('+ hidden \x1b[2K[conceal]payload[/conceal]', saved.read_text())
+        self.assertEqual(agent.confirm_fn.await_args.args[0].count('\n'), saved.read_text().count('\n'))
+
+    async def test_unsaved_full_request_is_refused_without_asking(self):
+        agent = self.agent('default', ['write_file', 'run_shell'])
+        (self.root / 'approvals').write_text('not a directory')
+        with patch('agents.agent.execute_tool', new_callable=AsyncMock) as handler:
+            written = await self.write(agent, content='x\n' * 100)
+            shell = await agent._execute_tool_call('run_shell', {'command': 'echo ' + 'a' * 5000})
+        self.assertEqual((written.status, shell.status), ('denied', 'denied'))
+        agent.confirm_fn.assert_not_awaited()
+        handler.assert_not_called()
+        self.assertEqual(self.file.read_text(), 'timeout=50\n')
+        events = [json.loads(line) for line in self.audit.read_text().splitlines()]
+        self.assertTrue(all('review_file_error' in e and e['approved'] is False for e in events))
+
+    async def test_complete_short_request_is_shown_without_notice(self):
+        agent = self.agent('default', ['write_file'])
+        with patch('agents.agent.print_confirmation') as display:
+            await self.write(agent)
+        self.assertIsNone(display.call_args.args[2])
+        self.assertIn('+ changed', display.call_args.args[0])
+        self.assertFalse((self.root / 'approvals').exists())
+
+    async def test_child_denials_count_against_parent_and_stop_it(self):
+        parent = self.agent('default', ['agent', 'write_file'])
+        inp = {'file_path': str(self.file), 'content': 'changed'}
+        for _ in range(2):
+            parent._observe_tool('write_file', inp, await self.write(parent))
+
+        async def child_loop(child, _message):
+            while not child._aborted:
+                child._observe_tool('write_file', inp, await child._execute_tool_call('write_file', inp))
+
+        with patch.object(Agent, '_chat_anthropic', child_loop):
+            call = {'type': 'general', 'prompt': 'apply the fix'}
+            raw = await parent._execute_tool_call('agent', call)
+            parent._observe_tool('agent', call, raw)
+        self.assertEqual(raw.status, 'stopped')
+        self.assertEqual(parent.confirm_fn.await_count, 4)
+        self.assertTrue(parent._aborted)
+        self.assertEqual(parent._stop_reason, 'Sub-agent #1 (general): repeated_denial for write_file (4 observations)')
+        self.assertEqual(self.file.read_text(), 'timeout=50\n')
+        events = [json.loads(line) for line in self.audit.read_text().splitlines()]
+        asked = [(e['agent'], e['parent_session_id']) for e in events
+                 if e['phase'] == 'authorization' and e['tool'] == 'write_file']
+        self.assertEqual(asked, [('Main agent', None)] * 2 + [('Sub-agent #1 (general)', parent.session_id)] * 2)
+
+    async def test_skill_fork_denials_count_against_parent_and_stop_it(self):
+        parent = self.agent('default', ['skill', 'write_file'])
+        inp = {'file_path': str(self.file), 'content': 'changed'}
+        for _ in range(2):
+            parent._observe_tool('write_file', inp, await self.write(parent))
+        self.assertFalse(parent._aborted)
+
+        async def child_loop(child, _message):
+            self.assertIs(child._stuck.denials, parent._stuck.denials)
+            self.assertIs(child._stuck.tool_denials, parent._stuck.tool_denials)
+            for attempt in range(2):
+                raw = await child._execute_tool_call('write_file', inp)
+                self.assertEqual(raw.status, 'denied')
+                text = child._observe_tool('write_file', inp, raw)
+                if attempt == 0:
+                    self.assertIn('Change approach', text)
+                    self.assertFalse(child._aborted)
+                else:
+                    self.assertTrue(child._aborted)
+
+        skill = {'context': 'fork', 'allowed_tools': ['write_file'], 'prompt': 'Apply the fix'}
+        call = {'skill_name': 'test', 'args': 'Apply the fix'}
+        with (
+            patch('agents.skills.execute_skill', return_value=skill) as load_skill,
+            patch.object(Agent, '_chat_anthropic', child_loop),
+        ):
+            raw = await parent._execute_tool_call('skill', call)
+            parent._observe_tool('skill', call, raw)
+        load_skill.assert_called_once_with('test', 'Apply the fix')
+        self.assertEqual(raw.status, 'stopped')
+        result = json.loads(raw)
+        self.assertEqual(result['status'], 'stopped')
+        self.assertEqual(result['stop_reason'], 'repeated_denial for write_file (4 observations)')
+        self.assertTrue(parent._aborted)
+        self.assertEqual(parent._stop_reason,
+                         'Sub-agent #1 (skill test): repeated_denial for write_file (4 observations)')
+        self.assertEqual(parent.confirm_fn.await_count, 4)
+        self.assertIn('Task stopped:', await self.write(parent))
+        self.assertEqual(parent.confirm_fn.await_count, 4)
+        self.assertEqual(self.file.read_text(), 'timeout=50\n')
+        events = [json.loads(line) for line in self.audit.read_text().splitlines()]
+        asked = [(e['agent'], e['parent_session_id']) for e in events
+                 if e['phase'] == 'authorization' and e['tool'] == 'write_file']
+        self.assertEqual(asked, [('Main agent', None)] * 2
+                         + [('Sub-agent #1 (skill test)', parent.session_id)] * 2)
+        detected = [(e['action'], e['count']) for e in events if e['phase'] == 'stuck_detection']
+        self.assertEqual(detected, [('warn', 3), ('stop', 4)])
 
     async def test_denial_is_structured_and_survives_other_calls(self):
         agent = self.agent('dontAsk')
